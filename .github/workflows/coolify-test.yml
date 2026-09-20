@@ -139,26 +139,11 @@ jobs:
           # Clear handshake flag
           rclone delete "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
 
-          # Start Cloudflare Tunnel connector with local wildcard ingress configuration
+          # Start Cloudflare Tunnel connector with token mode
           if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
-            echo "Configuring Cloudflare Tunnel with local wildcard ingress (*.justsawyou.cyou)..."
-            sudo mkdir -p /etc/cloudflared
-
-            # Safely generate /etc/cloudflared/credentials.json from CLOUDFLARE_TUNNEL_TOKEN
-            python3 -c "import os, base64, json; token = os.environ.get('CLOUDFLARE_TUNNEL_TOKEN', '').strip(); raw = json.loads(base64.b64decode(token)) if token else {}; creds = {'AccountTag': raw.get('a', ''), 'TunnelID': raw.get('t', ''), 'TunnelSecret': raw.get('s', '')}; open('/tmp/credentials.json', 'w').write(json.dumps(creds)) if creds.get('TunnelID') else None"
-            sudo mv -f /tmp/credentials.json /etc/cloudflared/credentials.json
-            sudo chmod 600 /etc/cloudflared/credentials.json
-
-            # Write verified repository wildcard ingress configuration
-            echo "dHVubmVsOiA1MjRkNmYwZS1mNzNjLTQ2NGMtYWFmZS0zMGZiNTkwMDEzMzYKY3JlZGVudGlhbHMtZmlsZTogL2V0Yy9jbG91ZGZsYXJlZC9jcmVkZW50aWFscy5qc29uCgppbmdyZXNzOgogIC0gaG9zdG5hbWU6ICJjb29saWZ5Lmp1c3RzYXd5b3UuY3lvdSIKICAgIHNlcnZpY2U6IGh0dHA6Ly9sb2NhbGhvc3Q6ODAwMAogIC0gaG9zdG5hbWU6ICJyZWFsdGltZS5qdXN0c2F3eW91LmN5b3UiCiAgICBzZXJ2aWNlOiBodHRwOi8vbG9jYWxob3N0OjYwMDEKICAtIGhvc3RuYW1lOiAiKi5qdXN0c2F3eW91LmN5b3UiCiAgICBzZXJ2aWNlOiBodHRwczovL2xvY2FsaG9zdDo0NDMKICAgIG9yaWdpblJlcXVlc3Q6CiAgICAgIG5vVExTVmVyaWZ5OiB0cnVlCiAgICAgIG1hdGNoU05JdG9Ib3N0OiB0cnVlCiAgLSBzZXJ2aWNlOiBodHRwX3N0YXR1czo0MDQK" | base64 -d | sudo tee /etc/cloudflared/config.yml >/dev/null
-            sudo chmod 600 /etc/cloudflared/config.yml
-
-            echo "Validating cloudflared ingress configuration..."
-            sudo cloudflared tunnel --config /etc/cloudflared/config.yml ingress validate || true
-
-            echo "Launching local-config cloudflared daemon..."
-            sudo cloudflared tunnel --config /etc/cloudflared/config.yml run > /tmp/cloudflared.log 2>&1 &
-            sleep 4
+            echo "Launching Cloudflare Tunnel with official edge token..."
+            sudo cloudflared tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+            sleep 6
 
             # Verify Coolify dashboard readiness on port 8000
             echo "Verifying Coolify dashboard responsiveness on port 8000..."
