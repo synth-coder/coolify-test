@@ -179,7 +179,7 @@ rclone dedupe "${RCLONE_OPTS[@]}" --dedupe-mode newest "${STORAGE_TARGET}" 2>/de
 
 # 12. Create 14-day rolling historical snapshot and prune expired records
 echo "[COOLIFY-SYNC] Archiving snapshot to history/${TIMESTAMP}..."
-rclone copy "${RCLONE_OPTS[@]}" "${STORAGE_TARGET}" "${STORAGE_TARGET}/history/${TIMESTAMP}" \
+rclone copy "${RCLONE_OPTS[@]}" "$LOCAL_STAGE" "${STORAGE_TARGET}/history/${TIMESTAMP}" \
   --include "coolify_bundle.tar.gz" \
   --include "volumes_bundle.tar.gz" \
   --include "coolify_pg_latest.sql.gz" \
