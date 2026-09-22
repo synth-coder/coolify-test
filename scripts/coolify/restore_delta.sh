@@ -301,17 +301,7 @@ if [ ${#COMPOSE_FILES[@]} -gt 0 ]; then
     fi
   fi
 
-  # 2. Parallel Pre-pull required images so containers start without delay
-  echo "[COOLIFY-RESTORE] Pre-fetching Docker images in parallel..."
-  for compose in "${COMPOSE_FILES[@]}"; do
-    workdir=$(dirname "$compose")
-    env_arg=""
-    [ -f "$workdir/.env" ] && env_arg="--env-file $workdir/.env"
-    (cd "$workdir" && sudo docker compose $env_arg -f "$compose" pull -q 2>/dev/null || true) &
-  done
-  wait
-
-  # 3. Create all required external networks (proven robust logic from commit c0383d6)
+  # 2. Create all required external networks (proven robust logic from commit c0383d6)
   echo "[COOLIFY-RESTORE] Guaranteeing all external networks exist..."
   sudo docker network create --attachable coolify 2>/dev/null || true
   for compose in "${COMPOSE_FILES[@]}"; do
