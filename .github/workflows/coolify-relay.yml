@@ -97,7 +97,7 @@ jobs:
               echo "Decompressing application volumes with 4-core pigz..."
               pigz -dc -p 4 /tmp/prewarm_cache/volumes_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes || true
             fi
-            rm -rf /tmp/prewarm_cache
+            sudo rm -rf /tmp/prewarm_cache
           else
             # Cycle 0: Check if existing baseline exists on Google Drive
             if grep -q "coolify_bundle.tar.gz" /tmp/prewarm_ls.txt; then
@@ -110,7 +110,7 @@ jobs:
 
               [ -f "/tmp/prewarm_cache/coolify_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/coolify_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /data/coolify || true
               [ -f "/tmp/prewarm_cache/volumes_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/volumes_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes || true
-              rm -rf /tmp/prewarm_cache
+              sudo rm -rf /tmp/prewarm_cache
             fi
           fi
 
