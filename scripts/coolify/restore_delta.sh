@@ -35,6 +35,7 @@ echo "[COOLIFY-RESTORE] Target: ${STORAGE_TARGET} | Cycle: ${CYCLE_COUNT}"
 echo "[COOLIFY-RESTORE] ======================================================="
 
 sudo mkdir -p "$SOURCE_DIR" /var/lib/docker/volumes "$BACKUP_DIR" "$CACHE_DIR"
+sudo chmod 777 "$CACHE_DIR"
 sudo rm -rf "${CACHE_DIR:?}"/*
 
 # Ensure pigz is installed for multi-core performance
