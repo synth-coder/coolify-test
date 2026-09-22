@@ -23,7 +23,7 @@ jobs:
   coolify-relay:
     name: Run Persistent Coolify Relay Node
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout Orchestration Repository
