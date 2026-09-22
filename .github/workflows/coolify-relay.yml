@@ -92,6 +92,7 @@ jobs:
             rclone copy "$TARGET" /tmp/prewarm_cache \
               --include "coolify_bundle.tar.gz" \
               --include "volumes_bundle.tar.gz" \
+              --include "coolify_pg_latest.sql.gz" \
               --drive-chunk-size 128M \
               --fast-list
 
@@ -103,6 +104,10 @@ jobs:
               echo "Decompressing application volumes with 4-core pigz..."
               pigz -dc -p 4 /tmp/prewarm_cache/volumes_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes || true
             fi
+            if [ -f "/tmp/prewarm_cache/coolify_pg_latest.sql.gz" ]; then
+              sudo mkdir -p /data/coolify/backups
+              sudo cp -f /tmp/prewarm_cache/coolify_pg_latest.sql.gz /data/coolify/backups/coolify_pg_latest.sql.gz
+            fi
             sudo rm -rf /tmp/prewarm_cache
           else
             # Cycle 0: Check if existing baseline exists on Google Drive
@@ -111,11 +116,16 @@ jobs:
               rclone copy "$TARGET" /tmp/prewarm_cache \
                 --include "coolify_bundle.tar.gz" \
                 --include "volumes_bundle.tar.gz" \
+                --include "coolify_pg_latest.sql.gz" \
                 --drive-chunk-size 128M \
                 --fast-list
 
               [ -f "/tmp/prewarm_cache/coolify_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/coolify_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /data/coolify || true
               [ -f "/tmp/prewarm_cache/volumes_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/volumes_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes || true
+              if [ -f "/tmp/prewarm_cache/coolify_pg_latest.sql.gz" ]; then
+                sudo mkdir -p /data/coolify/backups
+                sudo cp -f /tmp/prewarm_cache/coolify_pg_latest.sql.gz /data/coolify/backups/coolify_pg_latest.sql.gz
+              fi
               sudo rm -rf /tmp/prewarm_cache
             fi
           fi
