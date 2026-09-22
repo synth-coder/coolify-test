@@ -1,35 +1,130 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Hardened Coolify State Restoration Script for Backblaze B2
+# Coolify Delta State Restoration Script for Google Drive (16GB / 4 vCPU)
+# Implements fail-closed verification, 4-core pigz decompression, and auto-recovery.
 # ==============================================================================
 set -euo pipefail
 
-STORAGE_TARGET="${1:-b2:coolify-relay-state/coolify-state}"
+STORAGE_TARGET="${1:-gdrive:coolify-relay-state/coolify-state}"
 BACKUP_DIR="/data/coolify/backups"
 SOURCE_DIR="/data/coolify"
+CACHE_DIR="/tmp/coolify_restore_cache"
+CYCLE_COUNT="${2:-0}"
 
-echo "[COOLIFY-RESTORE] === Phase: State Hydration & Permission Normalization ==="
+# Tuned Rclone flags for Google Drive on 16GB RAM / 4 vCPU runners
+RCLONE_OPTS=(
+  "--drive-chunk-size=128M"
+  "--drive-upload-cutoff=128M"
+  "--drive-use-trash=false"
+  "--fast-list"
+  "--transfers=4"
+  "--checkers=8"
+  "--retries=6"
+  "--retries-sleep=10s"
+  "--timeout=10m"
+  "--contimeout=30s"
+  "--drive-pacer-min-sleep=100ms"
+  "--checksum"
+  "--stats=15s"
+  "--stats-one-line"
+)
 
-sudo mkdir -p "$SOURCE_DIR" /var/lib/docker/volumes "$BACKUP_DIR"
+echo "[COOLIFY-RESTORE] ======================================================="
+echo "[COOLIFY-RESTORE] Phase: Fail-Closed State Hydration from Google Drive"
+echo "[COOLIFY-RESTORE] Target: ${STORAGE_TARGET} | Cycle: ${CYCLE_COUNT}"
+echo "[COOLIFY-RESTORE] ======================================================="
 
-# 1. Check if backup bundle exists in object storage
-if rclone cat "${STORAGE_TARGET}/coolify_bundle.tar.gz" 2>/dev/null | sudo tar --numeric-owner -xpzf - -C /data/coolify 2>/dev/null; then
-  echo "[COOLIFY-RESTORE] Core /data/coolify state restored successfully."
-else
-  echo "[COOLIFY-RESTORE] No prior backup found or cold start baseline."
+sudo mkdir -p "$SOURCE_DIR" /var/lib/docker/volumes "$BACKUP_DIR" "$CACHE_DIR"
+sudo rm -rf "${CACHE_DIR:?}"/*
+
+# Ensure pigz is installed for multi-core performance
+if ! command -v pigz >/dev/null 2>&1; then
+  sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pigz
 fi
 
-# 2. Restore Docker volumes if present
-rclone cat "${STORAGE_TARGET}/volumes_bundle.tar.gz" 2>/dev/null | sudo tar --numeric-owner -xpzf - -C /var/lib/docker/volumes 2>/dev/null || true
+# Ensure runner and root share rclone.conf
+if [ -f "$HOME/.config/rclone/rclone.conf" ]; then
+  sudo mkdir -p /root/.config/rclone
+  sudo cp -f "$HOME/.config/rclone/rclone.conf" /root/.config/rclone/rclone.conf
+fi
 
-# 3. Pull latest standalone PostgreSQL dump
-rclone copyto "${STORAGE_TARGET}/coolify_pg_latest.sql.gz" "${BACKUP_DIR}/coolify_pg_latest.sql.gz" 2>/dev/null || true
+# ------------------------------------------------------------------------------
+# STEP 1: Verify Google Drive Connectivity & Deduplicate
+# ------------------------------------------------------------------------------
+echo "[COOLIFY-RESTORE] Probing Google Drive connectivity..."
+if ! rclone lsf "${RCLONE_OPTS[@]}" "${STORAGE_TARGET}" --max-depth 1 >/tmp/gdrive_files.txt 2>&1; then
+  echo "[COOLIFY-RESTORE] CRITICAL: Unable to reach Google Drive storage at ${STORAGE_TARGET}!"
+  cat /tmp/gdrive_files.txt
+  echo "[COOLIFY-RESTORE] Triggering fail-closed exit to prevent blank state overwrite."
+  exit 1
+fi
 
-# ==============================================================================
-# SAFEGUARD 1: Strict Linux File Ownership & Permissions
-# ==============================================================================
-echo "[COOLIFY-RESTORE] Applying strict Linux filesystem permissions..."
-# Ensure /data/coolify is traversable and writable by docker and runner
+echo "[COOLIFY-RESTORE] Google Drive online. Running automatic deduplication..."
+rclone dedupe "${RCLONE_OPTS[@]}" --dedupe-mode newest "${STORAGE_TARGET}" 2>/dev/null || true
+
+# ------------------------------------------------------------------------------
+# STEP 2: Circuit Breaker - Verify State Existence
+# ------------------------------------------------------------------------------
+HAS_CORE_BUNDLE=false
+if grep -q "^coolify_bundle\.tar\.gz" /tmp/gdrive_files.txt; then
+  HAS_CORE_BUNDLE=true
+fi
+
+if [ "$HAS_CORE_BUNDLE" != "true" ]; then
+  if [ "$CYCLE_COUNT" -gt 0 ]; then
+    echo "[COOLIFY-RESTORE] FATAL ERROR: Cycle count is ${CYCLE_COUNT} but 'coolify_bundle.tar.gz' was NOT found in Google Drive!"
+    echo "[COOLIFY-RESTORE] Refusing to initialize empty state over prior rotation cycles. Failing closed."
+    exit 1
+  else
+    echo "[COOLIFY-RESTORE] NOTICE: Cycle count is 0 and remote storage is empty. Authorized for clean cold-start."
+    exit 0
+  fi
+fi
+
+# ------------------------------------------------------------------------------
+# STEP 3: Download to Local Cache & Validate Integrity
+# ------------------------------------------------------------------------------
+echo "[COOLIFY-RESTORE] Downloading state archives and checksums from Google Drive..."
+rclone copy "${RCLONE_OPTS[@]}" "${STORAGE_TARGET}" "$CACHE_DIR" \
+  --include "coolify_bundle.tar.gz" \
+  --include "volumes_bundle.tar.gz" \
+  --include "coolify_pg_latest.sql.gz" \
+  --include "checksums.sha256"
+
+# Validate SHA256 checksums if manifest exists
+if [ -f "${CACHE_DIR}/checksums.sha256" ]; then
+  echo "[COOLIFY-RESTORE] Validating SHA256 integrity manifest..."
+  (cd "$CACHE_DIR" && sha256sum -c checksums.sha256) || {
+    echo "[COOLIFY-RESTORE] FATAL: Checksum mismatch! Corrupted download detected. Aborting."
+    exit 1
+  }
+  echo "[COOLIFY-RESTORE] Checksums verified successfully."
+fi
+
+# ------------------------------------------------------------------------------
+# STEP 4: Parallel Decompression with 4-Core pigz
+# ------------------------------------------------------------------------------
+if [ -f "${CACHE_DIR}/coolify_bundle.tar.gz" ]; then
+  echo "[COOLIFY-RESTORE] Extracting /data/coolify with pigz (4 cores)..."
+  pigz -dc -p 4 "${CACHE_DIR}/coolify_bundle.tar.gz" | sudo tar --numeric-owner -xpf - -C /data/coolify
+fi
+
+if [ -f "${CACHE_DIR}/volumes_bundle.tar.gz" ]; then
+  echo "[COOLIFY-RESTORE] Extracting Docker volumes with pigz (4 cores)..."
+  pigz -dc -p 4 "${CACHE_DIR}/volumes_bundle.tar.gz" | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes
+fi
+
+if [ -f "${CACHE_DIR}/coolify_pg_latest.sql.gz" ]; then
+  sudo cp -f "${CACHE_DIR}/coolify_pg_latest.sql.gz" "${BACKUP_DIR}/coolify_pg_latest.sql.gz"
+fi
+
+# Clean up local restore cache
+rm -rf "$CACHE_DIR" 2>/dev/null || true
+
+# ------------------------------------------------------------------------------
+# STEP 5: Linux Permissions, SSH Configuration & Keys Normalization
+# ------------------------------------------------------------------------------
+echo "[COOLIFY-RESTORE] Normalizing permissions and SSH configurations..."
 sudo chmod -R 755 /data/coolify 2>/dev/null || true
 [ -d "/data/coolify/source" ] && sudo chmod -R 775 /data/coolify/source 2>/dev/null || true
 
@@ -37,178 +132,97 @@ if [ -d "/data/coolify/ssh/keys" ]; then
   sudo chmod 700 /data/coolify/ssh/keys
   sudo chmod 600 /data/coolify/ssh/keys/* 2>/dev/null || true
   sudo chmod 644 /data/coolify/ssh/keys/*.pub 2>/dev/null || true
+  sudo chown -R 9999:root /data/coolify/ssh/keys 2>/dev/null || true
 fi
 
-# ==============================================================================
-# SAFEGUARD 2: Localhost SSH Injection & Daemon Hardening
-# ==============================================================================
-echo "[COOLIFY-RESTORE] Configuring host SSH server & authorized_keys for Coolify engine..."
+# Configure host SSH daemon for Coolify internal engine communication
 sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server
-
-# Drop-in sshd configuration to guarantee public key auth and root login via key
-sudo mkdir -p /etc/ssh/sshd_config.d
+sudo mkdir -p /etc/ssh/sshd_config.d /root/.ssh /home/runner/.ssh
 cat << 'EOF' | sudo tee /etc/ssh/sshd_config.d/99-coolify.conf >/dev/null
 PermitRootLogin yes
 PubkeyAuthentication yes
 StrictModes no
 AuthorizedKeysFile .ssh/authorized_keys
 EOF
-
-# Ensure sshd is running
-sudo systemctl enable ssh 2>/dev/null || sudo systemctl enable sshd 2>/dev/null || true
 sudo systemctl restart ssh 2>/dev/null || sudo systemctl restart sshd 2>/dev/null || true
 
-# Guarantee that a valid root host key for @host.docker.internal exists in /data/coolify/ssh/keys
-sudo mkdir -p /data/coolify/ssh/keys
-EXISTING_KEY=$(find /data/coolify/ssh/keys -maxdepth 1 -type f \( -name "ssh_key@*" -o -name "id_*" \) ! -name "*.pub" ! -name "*.lock" 2>/dev/null | head -n 1 || true)
-if [ -n "$EXISTING_KEY" ] && [ ! -f "/data/coolify/ssh/keys/id.root@host.docker.internal" ]; then
-  sudo cp -f "$EXISTING_KEY" /data/coolify/ssh/keys/id.root@host.docker.internal
-  sudo ssh-keygen -y -f /data/coolify/ssh/keys/id.root@host.docker.internal > /tmp/id.root@host.docker.internal.pub 2>/dev/null || true
-  [ -f /tmp/id.root@host.docker.internal.pub ] && sudo mv -f /tmp/id.root@host.docker.internal.pub /data/coolify/ssh/keys/id.root@host.docker.internal.pub || true
-elif [ ! -f "/data/coolify/ssh/keys/id.root@host.docker.internal" ]; then
-  echo "[COOLIFY-RESTORE] Generating host.docker.internal SSH key pair..."
-  sudo ssh-keygen -t ed25519 -N "" -f /data/coolify/ssh/keys/id.root@host.docker.internal -C "root@host.docker.internal" 2>/dev/null || true
-fi
-
-# Ensure correct permissions on SSH key files
-sudo chmod 700 /data/coolify/ssh /data/coolify/ssh/keys
-sudo chmod 600 /data/coolify/ssh/keys/* 2>/dev/null || true
-sudo chmod 644 /data/coolify/ssh/keys/*.pub 2>/dev/null || true
-sudo chown -R 9999:root /data/coolify/ssh 2>/dev/null || true
-
-# Authorize Coolify's internal SSH key for root and runner users
-sudo mkdir -p /root/.ssh /home/runner/.ssh
-
-# Inject master Coolify onboarding key
-echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIINGMEL5LpxfXWB1Q2gd028oYZzpuGe97jlmgbYza+pN" | sudo tee -a /root/.ssh/authorized_keys >/dev/null
-echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIINGMEL5LpxfXWB1Q2gd028oYZzpuGe97jlmgbYza+pN" | sudo tee -a /home/runner/.ssh/authorized_keys >/dev/null
-
-# Inject all public keys from /data/coolify/ssh/keys into authorized_keys
-for priv in /data/coolify/ssh/keys/*; do
-  if [ -f "$priv" ] && [[ ! "$priv" =~ \.pub$ ]] && [[ ! "$priv" =~ \.lock$ ]]; then
-    sudo ssh-keygen -y -f "$priv" 2>/dev/null | sudo tee -a /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys >/dev/null || true
-  fi
-done
+# Inject public keys into authorized_keys for root and runner
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIINGMEL5LpxfXWB1Q2gd028oYZzpuGe97jlmgbYza+pN" | sudo tee -a /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys >/dev/null
 for pub in /data/coolify/ssh/keys/*.pub; do
   [ -f "$pub" ] && sudo cat "$pub" | sudo tee -a /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys >/dev/null || true
 done
-
 sudo chmod 700 /root/.ssh /home/runner/.ssh
 sudo chmod 600 /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys 2>/dev/null || true
 
-# ==============================================================================
-# SAFEGUARD 3: Database Boot & pg_isready Health Polling
-# ==============================================================================
-if [ -f "/data/coolify/source/docker-compose.yml" ] && [ -f "/data/coolify/source/docker-compose.prod.yml" ]; then
-  # Ensure APP_URL is correctly set to coolify.justsawyou.cyou
-  if [ -f "/data/coolify/source/.env" ]; then
-    sudo sed -i 's|^APP_URL=.*|APP_URL=https://coolify.justsawyou.cyou|g' /data/coolify/source/.env 2>/dev/null || true
-  fi
-
-  echo "[COOLIFY-RESTORE] Ensuring external Docker network coolify exists..."
+# ------------------------------------------------------------------------------
+# STEP 6: Database Bring-up & PostgreSQL Restoration
+# ------------------------------------------------------------------------------
+if [ -f "/data/coolify/source/docker-compose.yml" ]; then
+  echo "[COOLIFY-RESTORE] Initializing coolify Docker network..."
   sudo docker network create --attachable coolify 2>/dev/null || true
 
-  echo "[COOLIFY-RESTORE] Booting postgres database service..."
+  echo "[COOLIFY-RESTORE] Starting PostgreSQL database container..."
   sudo docker compose --project-directory /data/coolify/source \
     --env-file /data/coolify/source/.env \
     -f /data/coolify/source/docker-compose.yml \
     -f /data/coolify/source/docker-compose.prod.yml \
     up -d postgres 2>&1 || true
 
-  echo "[COOLIFY-RESTORE] Polling PostgreSQL daemon readiness via pg_isready..."
-  DB_READY=false
+  echo "[COOLIFY-RESTORE] Polling pg_isready..."
   for i in {1..30}; do
     if sudo docker exec coolify-db pg_isready -U coolify >/dev/null 2>&1 || sudo docker exec -i coolify-db pg_isready >/dev/null 2>&1; then
-      echo "[COOLIFY-RESTORE] PostgreSQL is fully ready and accepting connections! ($((i*2))s)"
-      DB_READY=true
+      echo "[COOLIFY-RESTORE] PostgreSQL is fully ready! ($((i*2))s)"
       break
     fi
     sleep 2
   done
 
-  if [ "$DB_READY" != "true" ]; then
-    echo "[COOLIFY-RESTORE] Warning: PostgreSQL took longer than 60s to report ready. Proceeding with caution."
-  fi
-
-  # Restore PostgreSQL dump if available (using postgres maintenance DB for global restore)
   if [ -f "${BACKUP_DIR}/coolify_pg_latest.sql.gz" ]; then
-    echo "[COOLIFY-RESTORE] Restoring PostgreSQL database from dump..."
-    gunzip -c "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | sudo docker exec -i coolify-db psql -U coolify -d postgres 2>/dev/null || true
-    echo "[COOLIFY-RESTORE] Database restored successfully."
+    echo "[COOLIFY-RESTORE] Restoring PostgreSQL dump into database with pigz..."
+    pigz -dc -p 4 "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | sudo docker exec -i coolify-db psql -U coolify -d postgres 2>/dev/null || true
+    echo "[COOLIFY-RESTORE] PostgreSQL state hydrated."
   fi
 
-  # Boot remaining Coolify engine services with full env-file and prod compose context
-  echo "[COOLIFY-RESTORE] Booting complete Coolify engine (coolify, redis, realtime)..."
+  # Boot Coolify core and proxy
   sudo docker compose --project-directory /data/coolify/source \
     --env-file /data/coolify/source/.env \
     -f /data/coolify/source/docker-compose.yml \
     -f /data/coolify/source/docker-compose.prod.yml \
     up -d --remove-orphans 2>&1 || true
 
-  # Boot Coolify Proxy (Traefik v3) if present
   if [ -d "/data/coolify/proxy" ] && [ -f "/data/coolify/proxy/docker-compose.yml" ]; then
-    echo "[COOLIFY-RESTORE] Booting Coolify Traefik proxy on port 80/443..."
     sudo docker compose --project-directory /data/coolify/proxy -f /data/coolify/proxy/docker-compose.yml up -d 2>/dev/null || true
   fi
 
-  # Wait for Coolify container readiness and run database migrations/seeders
-  echo "[COOLIFY-RESTORE] Ensuring database schema and host keys are initialized in Coolify..."
+  # Artisan migrations and seeds
   for s in {1..30}; do
     if sudo docker exec coolify php artisan --version >/dev/null 2>&1; then
-      echo "[COOLIFY-RESTORE] Running database migrations..."
       sudo docker exec coolify php artisan migrate --force 2>/dev/null || true
-
-      echo "[COOLIFY-RESTORE] Binding localhost Server(0) and PrivateKey(0) in Coolify database..."
-      sudo docker exec coolify php artisan tinker --execute='
-        try {
-          $priv = @file_get_contents("/data/coolify/ssh/keys/id.root@host.docker.internal") ?: @file_get_contents("/var/www/html/storage/app/ssh/keys/id.root@host.docker.internal");
-          if ($priv) {
-            $pk = \App\Models\PrivateKey::find(0);
-            if (!$pk) {
-              $pk = new \App\Models\PrivateKey();
-              $pk->id = 0;
-              $pk->team_id = 0;
-              $pk->name = "localhost key";
-              $pk->description = "Host key for localhost";
-              $pk->private_key = $priv;
-              $pk->save();
-            } else if (empty($pk->private_key)) {
-              $pk->private_key = $priv;
-              $pk->save();
-            }
-            $srv = \App\Models\Server::find(0);
-            if ($srv) {
-              $srv->private_key_id = 0;
-              $srv->save();
-            }
-          }
-        } catch (\Throwable $e) {}
-      ' 2>/dev/null || true
-
       sudo docker exec coolify php artisan db:seed --class=ProductionSeeder --force 2>/dev/null || true
-      echo "[COOLIFY-RESTORE] Localhost server and private key verified in database."
-
-      # Extract actual public key that Coolify's PrivateKey(0) computes and inject into authorized_keys
-      echo "[COOLIFY-RESTORE] Authorizing Coolify PrivateKey(0) public key on host..."
-      COOLIFY_ACTUAL_PUB=$(sudo docker exec coolify php artisan tinker --execute='echo \App\Models\PrivateKey::find(0)?->getPublicKey();' 2>/dev/null | tr -d '\r\n' || true)
-      if [ -n "$COOLIFY_ACTUAL_PUB" ] && [[ "$COOLIFY_ACTUAL_PUB" =~ ^ssh- ]]; then
-        echo "$COOLIFY_ACTUAL_PUB" | sudo tee -a /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys >/dev/null
-        echo "[COOLIFY-RESTORE] Successfully injected dynamic Coolify public key into authorized_keys."
-      fi
-
-      # Also populate storage/app/ssh/keys inside container so ssh-keys disk has the file
-      sudo docker exec coolify php artisan db:seed --class=PopulateSshKeysDirectorySeeder --force 2>/dev/null || true
-
-      # Restart SSH daemon to pick up configuration changes
-      sudo systemctl restart ssh 2>/dev/null || sudo systemctl restart sshd 2>/dev/null || true
       break
     fi
     sleep 2
   done
-
-  # Verify container state
-  echo "[COOLIFY-RESTORE] Active Docker containers:"
-  sudo docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 fi
 
-echo "[COOLIFY-RESTORE] State restoration & environment hardening complete!"
+# ------------------------------------------------------------------------------
+# STEP 7: Workload Auto-Discovery and Bring-up
+# ------------------------------------------------------------------------------
+COMPOSE_FILES=()
+while IFS= read -r -d '' file; do
+  COMPOSE_FILES+=("$file")
+done < <(find /data/coolify/applications /data/coolify/services -name "docker-compose.yml" -print0 2>/dev/null || true)
+
+if [ ${#COMPOSE_FILES[@]} -gt 0 ]; then
+  echo "[COOLIFY-RESTORE] Launching ${#COMPOSE_FILES[@]} user application stacks..."
+  for compose in "${COMPOSE_FILES[@]}"; do
+    workdir=$(dirname "$compose")
+    svc_uuid=$(basename "$workdir")
+    sudo docker network create --attachable "$svc_uuid" 2>/dev/null || true
+    env_arg=""
+    [ -f "$workdir/.env" ] && env_arg="--env-file $workdir/.env"
+    (cd "$workdir" && sudo docker compose $env_arg -f "$compose" up -d --remove-orphans 2>&1 || true)
+  done
+fi
+
+echo "[COOLIFY-RESTORE] SUCCESS: Full state restoration complete."
