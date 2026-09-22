@@ -278,7 +278,7 @@ if [ -f "/data/coolify/source/docker-compose.yml" ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# STEP 7: Workload Auto-Discovery and Bring-up
+# STEP 7: Workload Auto-Discovery, Data Migration and Bring-up
 # ------------------------------------------------------------------------------
 COMPOSE_FILES=()
 while IFS= read -r -d '' file; do
@@ -286,15 +286,68 @@ while IFS= read -r -d '' file; do
 done < <(find /data/coolify/applications /data/coolify/services -name "docker-compose.yml" -print0 2>/dev/null || true)
 
 if [ ${#COMPOSE_FILES[@]} -gt 0 ]; then
-  echo "[COOLIFY-RESTORE] Launching ${#COMPOSE_FILES[@]} user application stacks..."
+  echo "[COOLIFY-RESTORE] Discovered ${#COMPOSE_FILES[@]} user application stacks."
+
+  # 1. Seamless Data Migration: If active code-server volume has empty workspace, migrate from prior volume
+  ACTIVE_CS_DIR="/var/lib/docker/volumes/o7fnohdje503ojdahkkscdqi_code-server-config/_data"
+  OLD_CS_DIR="/var/lib/docker/volumes/jxr4bhxlj2pgqn20fncu8cqc_code-server-config/_data"
+  if [ -d "$ACTIVE_CS_DIR" ] && [ -d "$OLD_CS_DIR" ]; then
+    if [ ! -f "$ACTIVE_CS_DIR/workspace/notes.txt" ] && [ -f "$OLD_CS_DIR/workspace/notes.txt" ]; then
+      echo "[COOLIFY-RESTORE] Migrating preserved files and Claude chat history to active Code Server volume..."
+      sudo cp -rn "$OLD_CS_DIR/workspace/"* "$ACTIVE_CS_DIR/workspace/" 2>/dev/null || true
+      [ -d "$OLD_CS_DIR/.claude" ] && sudo cp -rn "$OLD_CS_DIR/.claude" "$ACTIVE_CS_DIR/" 2>/dev/null || true
+      sudo chown -R 1000:1000 "$ACTIVE_CS_DIR" 2>/dev/null || true
+      echo "[COOLIFY-RESTORE] Preserved workspace and Claude chat logs migrated successfully!"
+    fi
+  fi
+
+  # 2. Parallel Pre-pull required images so containers start without delay
+  echo "[COOLIFY-RESTORE] Pre-fetching Docker images in parallel..."
+  for compose in "${COMPOSE_FILES[@]}"; do
+    workdir=$(dirname "$compose")
+    env_arg=""
+    [ -f "$workdir/.env" ] && env_arg="--env-file $workdir/.env"
+    (cd "$workdir" && sudo docker compose $env_arg -f "$compose" pull -q 2>/dev/null || true) &
+  done
+  wait
+
+  # 3. Create all required external networks (proven robust logic from commit c0383d6)
+  echo "[COOLIFY-RESTORE] Guaranteeing all external networks exist..."
+  sudo docker network create --attachable coolify 2>/dev/null || true
   for compose in "${COMPOSE_FILES[@]}"; do
     workdir=$(dirname "$compose")
     svc_uuid=$(basename "$workdir")
     sudo docker network create --attachable "$svc_uuid" 2>/dev/null || true
+
+    # Native compose network inspection
+    declared_nets=$(cd "$workdir" && sudo docker compose -f "$compose" config --networks 2>/dev/null || true)
+    for net in $declared_nets; do
+      if [ -n "$net" ] && [ "$net" != "default" ]; then
+        sudo docker network create --attachable "$net" 2>/dev/null || true
+      fi
+    done
+  done
+
+  # 4. Launch each service stack with explicit project-name and project-directory
+  for compose in "${COMPOSE_FILES[@]}"; do
+    workdir=$(dirname "$compose")
+    svc_uuid=$(basename "$workdir")
+    echo "[COOLIFY-RESTORE] Starting service stack for ${svc_uuid}..."
     env_arg=""
     [ -f "$workdir/.env" ] && env_arg="--env-file $workdir/.env"
-    (cd "$workdir" && sudo docker compose $env_arg -f "$compose" up -d --remove-orphans 2>&1 || true)
+    (cd "$workdir" && sudo docker compose $env_arg --project-directory "$workdir" --project-name "$svc_uuid" -f "$compose" up -d --remove-orphans 2>&1 || true)
+  done
+
+  # 5. Connect all application networks to coolify-proxy for instant routing
+  echo "[COOLIFY-RESTORE] Connecting application networks to coolify-proxy..."
+  for net in $(sudo docker network ls --format '{{.Name}}'); do
+    if [ "$net" != "bridge" ] && [ "$net" != "host" ] && [ "$net" != "none" ] && [ "$net" != "default" ]; then
+      sudo docker network connect "$net" coolify-proxy 2>/dev/null || true
+    fi
   done
 fi
+
+echo "[COOLIFY-RESTORE] All active containers post-restore:"
+sudo docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
 echo "[COOLIFY-RESTORE] SUCCESS: Full state restoration complete."
