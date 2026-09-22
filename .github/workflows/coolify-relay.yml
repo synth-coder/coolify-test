@@ -63,6 +63,7 @@ jobs:
 
           TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
           sudo mkdir -p /data/coolify /var/lib/docker/volumes /tmp/prewarm_cache
+          sudo chmod 777 /tmp/prewarm_cache
 
           # Validate Google Drive Connectivity
           echo "Probing Google Drive connectivity at ${TARGET}..."
