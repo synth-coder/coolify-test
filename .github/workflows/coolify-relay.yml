@@ -48,6 +48,12 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             curl jq rclone pigz netcat-openbsd sqlite3 dnsutils ca-certificates openssh-server
 
+          # Install cloudflared
+          echo "Installing Cloudflare Tunnel client (cloudflared)..."
+          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared noble main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
+
           # Restore Rclone configuration
           mkdir -p ~/.config/rclone
           sudo mkdir -p /root/.config/rclone
@@ -119,14 +125,15 @@ jobs:
       # =====================================================================
       # PHASE 2 & 3: HANDSHAKE, DELTA INGESTION & RESTORATION
       # =====================================================================
-      - name: Handshake & State Hydration
+      - name: Handshake, State Hydration & Cloudflare Tunnel
         env:
           PREV_PAT: ${{ secrets.PREV_PAT }}
           STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
           CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
         run: |
           set -euo pipefail
-          echo "=== PHASE 2 & 3: Handshake & State Hydration ==="
+          echo "=== PHASE 2 & 3: Handshake, State Hydration & Ingress Claim ==="
           TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
           CYCLE="${CYCLE_COUNT:-0}"
 
@@ -154,18 +161,48 @@ jobs:
           # Clear handshake flag
           rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
 
+          # Launch Cloudflare Tunnel connector with local wildcard ingress config
+          if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+            echo "Configuring local Cloudflare Tunnel credentials and wildcard ingress..."
+            sudo mkdir -p /etc/cloudflared
+            python3 -c "
+import os, base64, json
+token = os.environ.get('CLOUDFLARE_TUNNEL_TOKEN', '').strip()
+if token:
+    raw = json.loads(base64.b64decode(token))
+    creds = {
+        'AccountTag': raw.get('a', ''),
+        'TunnelID': raw.get('t', ''),
+        'TunnelSecret': raw.get('s', '')
+    }
+    with open('/tmp/credentials.json', 'w') as f:
+        json.dump(creds, f)
+"
+            sudo mv -f /tmp/credentials.json /etc/cloudflared/credentials.json
+            sudo chmod 600 /etc/cloudflared/credentials.json
+            sudo cp -f configs/cloudflared/config.yml /etc/cloudflared/config.yml
+            sudo chmod 600 /etc/cloudflared/config.yml
+
+            echo "Starting Cloudflare Tunnel daemon..."
+            sudo cloudflared tunnel --config /etc/cloudflared/config.yml run > /tmp/cloudflared.log 2>&1 &
+            sleep 5
+
+            echo "Awaiting local Coolify dashboard (port 8000)..."
+            COOLIFY_UP=false
+            for chk in {1..45}; do
+              if curl -fsS -o /dev/null --connect-timeout 2 http://localhost:8000; then
+                echo "SUCCESS: Coolify dashboard is responding on port 8000 ($((chk*2))s)."
+                COOLIFY_UP=true
+                break
+              fi
+              sleep 2
+            done
+            [ "$COOLIFY_UP" != "true" ] && sudo docker ps -a
+          fi
+
           # Comprehensive verification of Coolify dashboard, Traefik proxy, subdomains, and containers
           echo "=== VERIFYING SERVICES, SUBDOMAINS & PERMISSIONS ==="
           sudo docker ps -a
-
-          echo "Probing Coolify dashboard locally on port 8000..."
-          for i in {1..30}; do
-            if curl -fsS -o /dev/null --connect-timeout 2 http://localhost:8000; then
-              echo "Coolify dashboard responding on port 8000 ($((i*2))s)!"
-              break
-            fi
-            sleep 2
-          done
 
           echo "Testing Coolify getPublicKey() binding via tinker..."
           COOLIFY_KEY=$(sudo docker exec coolify php artisan tinker --execute='echo \App\Models\PrivateKey::find(0)?->getPublicKey();' 2>/dev/null | tr -d '\r\n' || true)
@@ -179,7 +216,7 @@ jobs:
           echo "Inspecting Traefik proxy routing (port 80/443)..."
           sudo docker ps --filter "name=coolify-proxy" --format "{{.Names}}: {{.Status}} ({{.Ports}})"
 
-          echo "State restored and verified!"
+          echo "State restored, tunnel online and verified!"
 
       # =====================================================================
       # PHASE 4: TEST SHIFT & SUCCESSOR HANDOVER DISPATCH
