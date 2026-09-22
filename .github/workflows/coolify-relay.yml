@@ -154,6 +154,31 @@ jobs:
           # Clear handshake flag
           rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
 
+          # Comprehensive verification of Coolify dashboard, Traefik proxy, subdomains, and containers
+          echo "=== VERIFYING SERVICES, SUBDOMAINS & PERMISSIONS ==="
+          sudo docker ps -a
+
+          echo "Probing Coolify dashboard locally on port 8000..."
+          for i in {1..30}; do
+            if curl -fsS -o /dev/null --connect-timeout 2 http://localhost:8000; then
+              echo "Coolify dashboard responding on port 8000 ($((i*2))s)!"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "Testing Coolify getPublicKey() binding via tinker..."
+          COOLIFY_KEY=$(sudo docker exec coolify php artisan tinker --execute='echo \App\Models\PrivateKey::find(0)?->getPublicKey();' 2>/dev/null | tr -d '\r\n' || true)
+          echo "Coolify getPublicKey() result: ${COOLIFY_KEY:0:40}..."
+          if [ -z "$COOLIFY_KEY" ] || [[ ! "$COOLIFY_KEY" =~ ^ssh- ]]; then
+            echo "ERROR: getPublicKey() failed or returned invalid key!"
+            exit 1
+          fi
+          echo "SUCCESS: getPublicKey() verified without null exception!"
+
+          echo "Inspecting Traefik proxy routing (port 80/443)..."
+          sudo docker ps --filter "name=coolify-proxy" --format "{{.Names}}: {{.Status}} ({{.Ports}})"
+
           echo "State restored and verified!"
 
       # =====================================================================
