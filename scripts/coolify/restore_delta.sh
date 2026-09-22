@@ -201,6 +201,8 @@ if [ -f "/data/coolify/source/docker-compose.yml" ]; then
   if [ -f "${BACKUP_DIR}/coolify_pg_latest.sql.gz" ]; then
     echo "[COOLIFY-RESTORE] Restoring PostgreSQL dump into database with pigz..."
     pigz -dc -p 4 "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | sudo docker exec -i coolify-db psql -U coolify -d postgres 2>/dev/null || true
+    # Also restore into coolify database directly in case pg_dump was used without \\connect
+    pigz -dc -p 4 "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | sudo docker exec -i coolify-db psql -U coolify -d coolify 2>/dev/null || true
     echo "[COOLIFY-RESTORE] PostgreSQL state hydrated."
   fi
 
@@ -215,11 +217,19 @@ if [ -f "/data/coolify/source/docker-compose.yml" ]; then
     sudo docker compose --project-directory /data/coolify/proxy -f /data/coolify/proxy/docker-compose.yml up -d 2>/dev/null || true
   fi
 
-  # Artisan migrations and seeds
+  # If database already had tables/users restored, do NOT re-run migrations/seeders
+  DB_HAS_USERS=$(sudo docker exec -i coolify-db psql -U coolify -d coolify -tAc "SELECT count(*) FROM users;" 2>/dev/null || echo "0")
+  echo "[COOLIFY-RESTORE] Verified existing database users: ${DB_HAS_USERS}"
+
   for s in {1..30}; do
     if sudo docker exec coolify php artisan --version >/dev/null 2>&1; then
-      echo "[COOLIFY-RESTORE] Running database migrations and seeds..."
-      sudo docker exec coolify php artisan migrate --force 2>/dev/null || true
+      if [ "$DB_HAS_USERS" -eq 0 ] 2>/dev/null; then
+        echo "[COOLIFY-RESTORE] Fresh database detected. Running initial migrations and ProductionSeeder..."
+        sudo docker exec coolify php artisan migrate --force 2>/dev/null || true
+        sudo docker exec coolify php artisan db:seed --class=ProductionSeeder --force 2>/dev/null || true
+      else
+        echo "[COOLIFY-RESTORE] Preserving existing database state. Skipping destructive seeders."
+      fi
 
       echo "[COOLIFY-RESTORE] Binding localhost Server(0) and PrivateKey(0) in Coolify database..."
       sudo docker exec coolify php artisan tinker --execute='
@@ -247,9 +257,6 @@ if [ -f "/data/coolify/source/docker-compose.yml" ]; then
           }
         } catch (\Throwable $e) {}
       ' 2>/dev/null || true
-
-      sudo docker exec coolify php artisan db:seed --class=ProductionSeeder --force 2>/dev/null || true
-      echo "[COOLIFY-RESTORE] Localhost server and private key verified in database."
 
       # Extract actual public key that Coolify PrivateKey(0) computes and inject into authorized_keys
       echo "[COOLIFY-RESTORE] Authorizing Coolify PrivateKey(0) public key on host..."
