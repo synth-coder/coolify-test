@@ -1,0 +1,32 @@
+# Cloudflare Tunnel Configuration for Coolify & Wildcard Edge Ingress
+# Ingress routes dashboard directly to port 8000, WebSockets to 6001,
+# and all wildcard application subdomains (*.justsawyou.cyou) to Traefik HTTPS (port 443).
+# Traefik inspects the HTTP Host / SNI header and dispatches to the right Docker container.
+
+tunnel: 524d6f0e-f73c-464c-aafe-30fb59001336
+credentials-file: /etc/cloudflared/credentials.json
+
+ingress:
+  # 1. Coolify Dashboard & Control Plane
+  - hostname: "coolify.justsawyou.cyou"
+    service: http://localhost:8000
+    originRequest:
+      connectTimeout: 15s
+
+  # 2. Coolify Realtime WebSockets
+  - hostname: "realtime.justsawyou.cyou"
+    service: http://localhost:6001
+    originRequest:
+      connectTimeout: 15s
+
+  # 3. Dynamic Wildcard for all user-deployed services/subdomains
+  - hostname: "*.justsawyou.cyou"
+    service: https://localhost:443
+    originRequest:
+      connectTimeout: 15s
+      noTLSVerify: true
+      matchSNItoHost: true
+
+  # 4. Catch-all fallback
+  - service: http_status:404
+
