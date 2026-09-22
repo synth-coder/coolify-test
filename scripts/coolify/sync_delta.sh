@@ -119,9 +119,6 @@ if sudo test -d "/var/lib/docker/volumes"; then
   sudo tar -cpf - -C /var/lib/docker/volumes \
     --warning=no-file-changed \
     --exclude="**/metadata.db" \
-    --exclude="*coolify-db-data*" \
-    --exclude="*coolify-db*" \
-    --exclude="*coolify_db*" \
     --exclude="*jlmfa7jdillwu9a9vfkh1hiz*" \
     --exclude="*izmik1wbhrzpzwcub5uji2vv*" \
     --exclude="**/node_modules" \
