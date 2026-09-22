@@ -48,11 +48,11 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             curl jq rclone pigz netcat-openbsd sqlite3 dnsutils ca-certificates openssh-server
 
-          # Install cloudflared
+          # Install cloudflared (direct official release deb)
           echo "Installing Cloudflare Tunnel client (cloudflared)..."
-          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared noble main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
-          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          cloudflared --version
 
           # Restore Rclone configuration
           mkdir -p ~/.config/rclone
@@ -161,31 +161,14 @@ jobs:
           # Clear handshake flag
           rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
 
-          # Launch Cloudflare Tunnel connector with local wildcard ingress config
+          # Launch Cloudflare Tunnel connector
           if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
-            echo "Configuring local Cloudflare Tunnel credentials and wildcard ingress..."
-            sudo mkdir -p /etc/cloudflared
-            python3 -c "
-import os, base64, json
-token = os.environ.get('CLOUDFLARE_TUNNEL_TOKEN', '').strip()
-if token:
-    raw = json.loads(base64.b64decode(token))
-    creds = {
-        'AccountTag': raw.get('a', ''),
-        'TunnelID': raw.get('t', ''),
-        'TunnelSecret': raw.get('s', '')
-    }
-    with open('/tmp/credentials.json', 'w') as f:
-        json.dump(creds, f)
-"
-            sudo mv -f /tmp/credentials.json /etc/cloudflared/credentials.json
-            sudo chmod 600 /etc/cloudflared/credentials.json
-            sudo cp -f configs/cloudflared/config.yml /etc/cloudflared/config.yml
-            sudo chmod 600 /etc/cloudflared/config.yml
+            echo "Starting Cloudflare Tunnel daemon with token..."
+            sudo cloudflared tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+            sleep 6
 
-            echo "Starting Cloudflare Tunnel daemon..."
-            sudo cloudflared tunnel --config /etc/cloudflared/config.yml run > /tmp/cloudflared.log 2>&1 &
-            sleep 5
+            echo "=== CLOUDFLARED LOGS (FIRST 15 LINES) ==="
+            head -n 15 /tmp/cloudflared.log || true
 
             echo "Awaiting local Coolify dashboard (port 8000)..."
             COOLIFY_UP=false
@@ -198,6 +181,21 @@ if token:
               sleep 2
             done
             [ "$COOLIFY_UP" != "true" ] && sudo docker ps -a
+
+            echo "Verifying public Cloudflare tunnel endpoint..."
+            for cf_chk in {1..15}; do
+              CF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 https://coolify.justsawyou.cyou || echo "000")
+              echo "Public URL check (${cf_chk}/15): HTTP ${CF_STATUS}"
+              if [ "$CF_STATUS" != "530" ] && [ "$CF_STATUS" != "000" ]; then
+                echo "SUCCESS: Cloudflare tunnel is publicly active (HTTP ${CF_STATUS})!"
+                break
+              fi
+              sleep 2
+            done
+            if [ "$CF_STATUS" = "530" ] || [ "$CF_STATUS" = "000" ]; then
+              echo "::warning::Cloudflare tunnel still returning ${CF_STATUS}, printing full log:"
+              cat /tmp/cloudflared.log || true
+            fi
           fi
 
           # Comprehensive verification of Coolify dashboard, Traefik proxy, subdomains, and containers
