@@ -278,28 +278,24 @@ jobs:
           PRIMARY_TARGET="${REPOS[$NEXT_INDEX]}"
           NEXT_CYCLE=$((CYCLE + 1))
 
-          # Only dispatch successor if cycle is 0 (to test 1 full A -> B handover cycle)
-          if [ "$CYCLE" -eq 0 ]; then
-            echo "Dispatching successor runner to ${PRIMARY_TARGET} (Cycle ${NEXT_CYCLE})..."
-            GH_TOKEN="$NEXT_PAT" gh workflow run coolify-relay.yml \
-              --repo "$PRIMARY_TARGET" \
-              --ref main \
-              -f cycle_count="$NEXT_CYCLE" \
-              -f retry_depth="0" \
-              -f test_handover="10"
-            echo "Successfully dispatched successor!"
+          # Continuous Handover Ring: Always dispatch successor after 10-minute shift
+          echo "Dispatching successor runner to ${PRIMARY_TARGET} (Cycle ${NEXT_CYCLE})..."
+          GH_TOKEN="$NEXT_PAT" gh workflow run coolify-relay.yml \
+            --repo "$PRIMARY_TARGET" \
+            --ref main \
+            -f cycle_count="$NEXT_CYCLE" \
+            -f retry_depth="0" \
+            -f test_handover="10"
+          echo "Successfully dispatched successor!"
 
-            # 4. Await successor handshake claim
-            echo "Awaiting successor to claim delta flag on Google Drive..."
-            for check in {1..30}; do
-              if ! rclone cat --drive-use-trash=false "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
-                echo "Successor has claimed state! Handover verified!"
-                break
-              fi
-              sleep 5
-            done
-          else
-            echo "Cycle ${CYCLE} is the successor. Handover cycle complete! Halting test ring."
-          fi
+          # 4. Await successor handshake claim
+          echo "Awaiting successor to claim delta flag on Google Drive..."
+          for check in {1..40}; do
+            if ! rclone cat --drive-use-trash=false "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
+              echo "Successor has claimed state! Handover verified!"
+              break
+            fi
+            sleep 5
+          done
 
           exit 0
