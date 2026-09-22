@@ -239,7 +239,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== PHASE 4: Shift Active ==="
-          HANDOVER_MINUTE=2
+          HANDOVER_MINUTE=10
           if [ -n "$TEST_HANDOVER" ] && [ "$TEST_HANDOVER" -gt 0 ] 2>/dev/null; then
             HANDOVER_MINUTE=$TEST_HANDOVER
           fi
@@ -286,7 +286,7 @@ jobs:
               --ref main \
               -f cycle_count="$NEXT_CYCLE" \
               -f retry_depth="0" \
-              -f test_handover="1"
+              -f test_handover="10"
             echo "Successfully dispatched successor!"
 
             # 4. Await successor handshake claim
