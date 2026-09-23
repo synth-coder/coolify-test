@@ -125,7 +125,6 @@ if sudo test -d "/var/lib/docker/volumes"; then
   archive_and_upload "/var/lib/docker/volumes" \
     "${LOCAL_STAGE}/volumes_bundle.tar.gz" \
     "${STORAGE_TARGET}/volumes_bundle.tar.gz" \
-    --exclude="**/metadata.db" \
     --exclude="*coolify-db-data*" \
     --exclude="*coolify-db*" \
     --exclude="*coolify_db*"
