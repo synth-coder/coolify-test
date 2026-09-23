@@ -23,24 +23,7 @@ fi
 
 echo "[COOLIFY-SYNC] === Initiating Universal State Dump & Google Drive Backup ==="
 
-# 1. Check if Coolify DB container is running and dump PostgreSQL atomically
-if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
-  echo "[COOLIFY-SYNC] Dumping Coolify PostgreSQL database (coolify-db)..."
-  sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | pigz -p 4 -6 > "${BACKUP_DIR}/coolify_pg_latest.sql.gz" || \
-    (sudo docker exec coolify-db pg_dumpall -U coolify --clean | gzip > "${BACKUP_DIR}/coolify_pg_latest.sql.gz")
-  echo "[COOLIFY-SYNC] DB dump complete: $(du -sh "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | cut -f1)"
-fi
-
-# 2. Check for SQLite databases across applications/services and snapshot cleanly
-if command -v sqlite3 >/dev/null 2>&1; then
-  while IFS= read -r -d '' sqldb; do
-    if [ -f "$sqldb" ]; then
-      sqlite3 "$sqldb" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
-    fi
-  done < <(sudo find /data/coolify -type f \( -name "*.sqlite" -o -name "*.db" \) -print0 2>/dev/null || true)
-fi
-
-# 3. Cleanly flush write buffers across all active user containers
+# 1. Cleanly stop user workload containers first to flush all write buffers
 echo "[COOLIFY-SYNC] Flushing write buffers across active workload containers..."
 COMPOSE_LIST=()
 while IFS= read -r -d '' compose; do
@@ -51,9 +34,28 @@ for compose in "${COMPOSE_LIST[@]}"; do
   workdir=$(dirname "$compose")
   env_arg=""
   [ -f "$workdir/.env" ] && env_arg="--env-file $workdir/.env"
-  (cd "$workdir" && sudo docker compose $env_arg -f "$compose" stop -t 5 2>/dev/null || true)
+  (cd "$workdir" && sudo docker compose $env_arg -f "$compose" stop -t 10 2>/dev/null || true)
 done
 
+# 2. Checkpoint SQLite WAL files cleanly now that processes are stopped
+if command -v sqlite3 >/dev/null 2>&1; then
+  echo "[COOLIFY-SYNC] Checkpointing SQLite WAL files across volumes and configurations..."
+  while IFS= read -r -d '' sqldb; do
+    if [ -f "$sqldb" ]; then
+      sqlite3 "$sqldb" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
+    fi
+  done < <(sudo find /data/coolify /var/lib/docker/volumes -type f \( -name "*.sqlite" -o -name "*.db" \) -print0 2>/dev/null || true)
+fi
+
+# 3. Dump Coolify PostgreSQL database atomically while coolify-db is running
+if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
+  echo "[COOLIFY-SYNC] Dumping Coolify PostgreSQL database (coolify-db)..."
+  sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | pigz -p 4 -6 > "${BACKUP_DIR}/coolify_pg_latest.sql.gz" || \
+    (sudo docker exec coolify-db pg_dumpall -U coolify --clean | gzip > "${BACKUP_DIR}/coolify_pg_latest.sql.gz")
+  echo "[COOLIFY-SYNC] DB dump complete: $(du -sh "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | cut -f1)"
+fi
+
+# 4. Stop Coolify core application engine
 if [ -f "/data/coolify/source/docker-compose.yml" ]; then
   (cd /data/coolify/source && sudo docker compose --env-file .env -f docker-compose.yml -f docker-compose.prod.yml stop -t 10 coolify coolify-db 2>/dev/null || \
    cd /data/coolify/source && sudo docker compose stop -t 10 coolify coolify-db 2>/dev/null || true)
