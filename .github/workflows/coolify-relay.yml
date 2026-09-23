@@ -160,7 +160,9 @@ jobs:
               sleep 6
             done
             if [ "$FLAG_FOUND" != "true" ]; then
-              echo "::warning::Sync complete flag timed out after 180s. Proceeding with latest verified state."
+              echo "::error::Predecessor sync_complete flag timed out after 180s! Predecessor may still be uploading or failed."
+              echo "Aborting state hydration to prevent downloading torn or corrupted state."
+              exit 1
             fi
           fi
 
@@ -264,7 +266,7 @@ jobs:
           # 2. Create synchronization flag on Google Drive
           rclone touch --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
 
-          # 3. Dispatch successor runner across the test ring
+          # 3. Dispatch successor runner across the test ring BEFORE releasing ingress
           REPOS=(
             "silver-demon61/coolify-test"
             "synth-coder/coolify-test"
@@ -282,17 +284,37 @@ jobs:
           PRIMARY_TARGET="${REPOS[$NEXT_INDEX]}"
           NEXT_CYCLE=$((CYCLE + 1))
 
-          # Continuous Handover Ring: Always dispatch successor after 10-minute shift
-          echo "Dispatching successor runner to ${PRIMARY_TARGET} (Cycle ${NEXT_CYCLE})..."
-          GH_TOKEN="$NEXT_PAT" gh workflow run test_handover_workflow.yml \
-            --repo "$PRIMARY_TARGET" \
-            --ref main \
-            -f cycle_count="$NEXT_CYCLE" \
-            -f retry_depth="0" \
-            -f test_handover="10"
-          echo "Successfully dispatched successor!"
+          dispatch_runner() {
+            local target="$1"
+            local token="$2"
+            for attempt in 1 2 3 4; do
+              echo "Dispatch attempt $attempt to ${target}..."
+              if GH_TOKEN="$token" gh workflow run coolify-relay.yml \
+                --repo "$target" \
+                --ref main \
+                -f cycle_count="$NEXT_CYCLE" \
+                -f retry_depth="0" \
+                -f test_handover="10"; then
+                echo "Successfully triggered workflow on ${target}."
+                return 0
+              fi
+              sleep 15
+            done
+            return 1
+          }
 
-          # 4. Await successor handshake claim
+          echo "Dispatching successor runner to ${PRIMARY_TARGET} (Cycle ${NEXT_CYCLE})..."
+          if ! dispatch_runner "$PRIMARY_TARGET" "$NEXT_PAT"; then
+            echo "CRITICAL: All successor dispatches failed!"
+            rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+            exit 1
+          fi
+
+          # 4. Successor dispatched successfully: release Cloudflare Tunnel connector
+          echo "Successor successfully dispatched. Releasing Cloudflare Tunnel connector to prevent traffic collision..."
+          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
+
+          # 5. Await successor handshake claim
           echo "Awaiting successor to claim delta flag on Google Drive..."
           for check in {1..40}; do
             if ! rclone cat --drive-use-trash=false "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
@@ -303,3 +325,13 @@ jobs:
           done
 
           exit 0
+
+      # =====================================================================
+      # PHASE 5: TEARDOWN
+      # =====================================================================
+      - name: Final Teardown Safety Check
+        if: always()
+        run: |
+          echo "=== PHASE 5: Teardown ==="
+          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
+          (cd /data/coolify/source 2>/dev/null && sudo docker compose down -t 2) || true
