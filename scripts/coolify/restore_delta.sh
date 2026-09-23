@@ -8,35 +8,56 @@
 set -euo pipefail
 
 STORAGE_TARGET="${1:-gdrive:coolify-relay-state/coolify-state}"
+CYCLE_COUNT="${2:-0}"
 BACKUP_DIR="/data/coolify/backups"
 SOURCE_DIR="/data/coolify"
+STAGE_DIR="/tmp/coolify_restore_stage"
 
 echo "[COOLIFY-RESTORE] === Universal State Hydration & Environment Provisioning ==="
+echo "[COOLIFY-RESTORE] Storage Target: ${STORAGE_TARGET} (Cycle: ${CYCLE_COUNT})"
 
-sudo mkdir -p "$SOURCE_DIR" /var/lib/docker/volumes "$BACKUP_DIR"
+sudo mkdir -p "$SOURCE_DIR" /var/lib/docker/volumes "$BACKUP_DIR" "$STAGE_DIR"
+sudo chmod 777 "$STAGE_DIR"
 
-# 1. Restore Core /data/coolify bundle
-echo "[COOLIFY-RESTORE] Fetching core Coolify configuration bundle..."
-if command -v pigz >/dev/null 2>&1; then
-  rclone cat --drive-chunk-size=128M --drive-use-trash=false "${STORAGE_TARGET}/coolify_bundle.tar.gz" 2>/dev/null | \
-    pigz -dc -p 4 | sudo tar --numeric-owner -xpf - -C /data/coolify 2>/dev/null || true
-else
-  rclone cat --drive-chunk-size=128M --drive-use-trash=false "${STORAGE_TARGET}/coolify_bundle.tar.gz" 2>/dev/null | \
-    sudo tar --numeric-owner -xpzf - -C /data/coolify 2>/dev/null || true
-fi
+# Helper for staged, verified download and extraction (prevents partial extract on 403s)
+stage_and_extract() {
+  local remote_file="$1"
+  local target_dir="$2"
+  local local_stage="${STAGE_DIR}/${remote_file}"
 
-# 2. Restore all Docker application volumes
-echo "[COOLIFY-RESTORE] Fetching application volumes..."
-if command -v pigz >/dev/null 2>&1; then
-  rclone cat --drive-chunk-size=128M --drive-use-trash=false "${STORAGE_TARGET}/volumes_bundle.tar.gz" 2>/dev/null | \
-    pigz -dc -p 4 | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes 2>/dev/null || true
-else
-  rclone cat --drive-chunk-size=128M --drive-use-trash=false "${STORAGE_TARGET}/volumes_bundle.tar.gz" 2>/dev/null | \
-    sudo tar --numeric-owner -xpzf - -C /var/lib/docker/volumes 2>/dev/null || true
-fi
+  echo "[COOLIFY-RESTORE] Checking for ${remote_file} in ${STORAGE_TARGET}..."
+  if rclone lsf --drive-use-trash=false "${STORAGE_TARGET}/${remote_file}" 2>/dev/null | grep -q "^${remote_file}$"; then
+    echo "[COOLIFY-RESTORE] Staging ${remote_file} to local NVMe storage..."
+    rclone copyto --drive-chunk-size=128M --drive-use-trash=false --retries=5 --low-level-retries=10 \
+      "${STORAGE_TARGET}/${remote_file}" "$local_stage"
+
+    if [ ! -s "$local_stage" ]; then
+      echo "[COOLIFY-RESTORE] ERROR: Staged file $local_stage is missing or empty!"
+      return 1
+    fi
+
+    echo "[COOLIFY-RESTORE] Extracting ${remote_file} into ${target_dir}..."
+    if command -v pigz >/dev/null 2>&1; then
+      pigz -dc -p 4 "$local_stage" | sudo tar --numeric-owner -xpf - -C "$target_dir"
+    else
+      sudo tar --numeric-owner -xpzf "$local_stage" -C "$target_dir"
+    fi
+    sudo rm -f "$local_stage"
+    echo "[COOLIFY-RESTORE] ${remote_file} successfully hydrated."
+  else
+    echo "[COOLIFY-RESTORE] Notice: ${remote_file} not found on remote storage."
+  fi
+}
+
+# 1. Sequentially stage and extract bundles (strictly bounded disk footprint)
+stage_and_extract "coolify_bundle.tar.gz" "/data/coolify"
+stage_and_extract "volumes_bundle.tar.gz" "/var/lib/docker/volumes"
 
 # 3. Pull standalone PostgreSQL dump
-rclone copyto --drive-chunk-size=128M --drive-use-trash=false "${STORAGE_TARGET}/coolify_pg_latest.sql.gz" "${BACKUP_DIR}/coolify_pg_latest.sql.gz" 2>/dev/null || true
+echo "[COOLIFY-RESTORE] Staging PostgreSQL dump..."
+rclone copyto --drive-chunk-size=128M --drive-use-trash=false --retries=5 \
+  "${STORAGE_TARGET}/coolify_pg_latest.sql.gz" "${BACKUP_DIR}/coolify_pg_latest.sql.gz" 2>/dev/null || true
+sudo rm -rf "$STAGE_DIR"
 
 # ==============================================================================
 # SAFEGUARD 1: Strict Linux File Ownership & Permissions
@@ -144,6 +165,24 @@ if [ -f "/data/coolify/source/docker-compose.yml" ] && [ -f "/data/coolify/sourc
       gunzip -c "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | sudo docker exec -i coolify-db psql -U coolify -d postgres 2>/dev/null || true
     fi
     echo "[COOLIFY-RESTORE] Database restored successfully."
+
+    # Post-Restore Sanity Check: If compose projects exist on disk, database records must not be zero!
+    DISK_COMPOSE_COUNT=$(sudo find /data/coolify/services /data/coolify/applications -name "docker-compose.yml" 2>/dev/null | wc -l || echo 0)
+    if [ "$DISK_COMPOSE_COUNT" -gt 0 ] && [ "${CYCLE_COUNT:-0}" != "0" ]; then
+      DB_PASS=$(grep '^DB_PASSWORD=' /data/coolify/source/.env 2>/dev/null | head -n 1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d '\r\n' || true)
+      DB_USER=$(grep '^DB_USERNAME=' /data/coolify/source/.env 2>/dev/null | head -n 1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d '\r\n' || echo "coolify")
+      DB_SVCS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "SELECT count(*) FROM services;" 2>/dev/null || echo 0)
+      DB_APPS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "SELECT count(*) FROM applications;" 2>/dev/null || echo 0)
+      TOTAL_RECORDS=$(( ${DB_SVCS:-0} + ${DB_APPS:-0} ))
+
+      if [ "$TOTAL_RECORDS" -eq 0 ]; then
+        echo "[COOLIFY-RESTORE] CRITICAL: Post-restore sanity check failed!"
+        echo "[COOLIFY-RESTORE] Disk contains $DISK_COMPOSE_COUNT service/app stacks, but database records == 0."
+        echo "[COOLIFY-RESTORE] Halting to trigger circuit breaker and prevent blank state overwrite."
+        exit 1
+      fi
+      echo "[COOLIFY-RESTORE] Database sanity check passed: $TOTAL_RECORDS records verified for $DISK_COMPOSE_COUNT compose stack(s)."
+    fi
   fi
 
   # Boot remaining Coolify engine services
@@ -210,14 +249,50 @@ fi
 
 # ==============================================================================
 # SAFEGUARD 4: Database-Verified Active Service Discovery & Startup
-# Completely prevents URL / Domain collisions by filtering out deleted ghost services
+# Dynamic information_schema table union excludes deleted ghost services
 # ==============================================================================
 echo "[COOLIFY-RESTORE] Querying Coolify database for verified active resource catalog..."
 
 ACTIVE_UUIDS=()
 
-# Strategy 1: Coolify Artisan Tinker (Native Eloquent / Laravel DB abstraction)
-if sudo docker ps --format '{{.Names}}' | grep -q '^coolify$'; then
+# Strategy 1 (Primary): Direct authenticated PostgreSQL information_schema introspection
+if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
+  DB_PASS=$(grep '^DB_PASSWORD=' /data/coolify/source/.env 2>/dev/null | head -n 1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d '\r\n' || true)
+  DB_USER=$(grep '^DB_USERNAME=' /data/coolify/source/.env 2>/dev/null | head -n 1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d '\r\n' || echo "coolify")
+
+  DISCOVERY_SQL="
+    SELECT c1.table_name
+    FROM information_schema.columns c1
+    JOIN information_schema.columns c2
+      ON c1.table_schema = c2.table_schema AND c1.table_name = c2.table_name
+    WHERE c1.table_schema = 'public'
+      AND c1.column_name = 'uuid'
+      AND c2.column_name = 'deleted_at'
+      AND c1.table_name NOT IN ('servers', 'teams', 'users', 'oauth_access_tokens', 'personal_access_tokens');
+  "
+
+  TARGET_TABLES=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "$DISCOVERY_SQL" 2>/dev/null || true)
+
+  if [ -n "$TARGET_TABLES" ]; then
+    UNION_QUERIES=()
+    while IFS= read -r tbl; do
+      trimmed_tbl=$(echo "$tbl" | tr -d '[:space:]')
+      [ -n "$trimmed_tbl" ] && UNION_QUERIES+=("SELECT uuid FROM ${trimmed_tbl} WHERE deleted_at IS NULL")
+    done <<< "$TARGET_TABLES"
+
+    if [ ${#UNION_QUERIES[@]} -gt 0 ]; then
+      FULL_QUERY=$(IFS=$'\n'; echo "${UNION_QUERIES[*]}" | paste -sd ' ' - | sed 's/ SELECT / UNION SELECT /g')
+      RAW_UUIDS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "${FULL_QUERY};" 2>/dev/null || true)
+      while IFS= read -r line; do
+        trimmed=$(echo "$line" | tr -d '[:space:]')
+        [ -n "$trimmed" ] && ACTIVE_UUIDS+=("$trimmed")
+      done <<< "$RAW_UUIDS"
+    fi
+  fi
+fi
+
+# Strategy 2 (Fallback): Coolify Artisan Tinker via Laravel DB abstraction
+if [ ${#ACTIVE_UUIDS[@]} -eq 0 ] && sudo docker ps --format '{{.Names}}' | grep -q '^coolify$'; then
   RAW_UUIDS=$(sudo docker exec coolify php artisan tinker --execute='
     $tables = [
       "services", "applications",
@@ -237,35 +312,6 @@ if sudo docker ps --format '{{.Names}}' | grep -q '^coolify$'; then
     echo implode("\n", array_unique(array_filter($uuids)));
   ' 2>/dev/null || true)
 
-  while IFS= read -r line; do
-    trimmed=$(echo "$line" | tr -d '[:space:]')
-    [ -n "$trimmed" ] && ACTIVE_UUIDS+=("$trimmed")
-  done <<< "$RAW_UUIDS"
-fi
-
-# Strategy 2: Direct authenticated PostgreSQL fallback if Tinker returned 0
-if [ ${#ACTIVE_UUIDS[@]} -eq 0 ] && sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
-  DB_PASS=""
-  DB_USER="coolify"
-  if [ -f "/data/coolify/source/.env" ]; then
-    DB_PASS=$(grep '^DB_PASSWORD=' /data/coolify/source/.env | cut -d= -f2- | tr -d '\r\n' || true)
-    DB_USER=$(grep '^DB_USERNAME=' /data/coolify/source/.env | cut -d= -f2- | tr -d '\r\n' || echo "coolify")
-  fi
-
-  DB_QUERY="
-    SELECT uuid FROM services WHERE deleted_at IS NULL
-    UNION SELECT uuid FROM applications WHERE deleted_at IS NULL
-    UNION SELECT uuid FROM standalone_postgresqls WHERE deleted_at IS NULL
-    UNION SELECT uuid FROM standalone_mysqls WHERE deleted_at IS NULL
-    UNION SELECT uuid FROM standalone_mariadbs WHERE deleted_at IS NULL
-    UNION SELECT uuid FROM standalone_mongodbs WHERE deleted_at IS NULL
-    UNION SELECT uuid FROM standalone_redises WHERE deleted_at IS NULL
-    UNION SELECT uuid FROM standalone_keydbs WHERE deleted_at IS NULL
-    UNION SELECT uuid FROM standalone_dragonflies WHERE deleted_at IS NULL
-    UNION SELECT uuid FROM standalone_clickhouses WHERE deleted_at IS NULL
-    UNION SELECT uuid FROM standalone_valkeys WHERE deleted_at IS NULL;
-  "
-  RAW_UUIDS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "$DB_QUERY" 2>/dev/null || true)
   while IFS= read -r line; do
     trimmed=$(echo "$line" | tr -d '[:space:]')
     [ -n "$trimmed" ] && ACTIVE_UUIDS+=("$trimmed")
