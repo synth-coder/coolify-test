@@ -53,6 +53,10 @@ stage_and_extract() {
 stage_and_extract "coolify_bundle.tar.gz" "/data/coolify"
 stage_and_extract "volumes_bundle.tar.gz" "/var/lib/docker/volumes"
 
+# Restart Docker daemon to index all extracted volumes
+echo "[COOLIFY-RESTORE] Reloading Docker daemon to recognize restored volumes..."
+sudo systemctl restart docker 2>/dev/null || true
+
 # 3. Pull standalone PostgreSQL dump
 echo "[COOLIFY-RESTORE] Staging PostgreSQL dump..."
 rclone copyto --drive-chunk-size=128M --drive-use-trash=false --retries=5 \
@@ -331,34 +335,44 @@ while IFS= read -r -d '' file; do
 done < <(find /data/coolify/applications /data/coolify/services /data/coolify/databases -name "docker-compose.yml" -print0 2>/dev/null || true)
 
 ACTIVE_COMPOSE=()
+CLAIMED_DOMAINS=()
+
 for compose in "${ALL_COMPOSE[@]}"; do
   workdir=$(dirname "$compose")
   svc_uuid=$(basename "$workdir")
 
-  # Only start if UUID is registered and active in the database
-  # Strict fail-closed guard: If database is running, an empty active list strictly means 0 services should start
+  # 1. Check if UUID is explicitly active in the database
   is_active=false
-  if [ ${#ACTIVE_UUIDS[@]} -eq 0 ]; then
-    if ! sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
-      echo "[COOLIFY-RESTORE] Warning: Database container unreachable, falling back to disk compose files."
+  for active_id in "${ACTIVE_UUIDS[@]}"; do
+    if [ "$active_id" = "$svc_uuid" ]; then
       is_active=true
-    else
-      echo "[COOLIFY-RESTORE] Database active but returned 0 live UUIDs. Not starting zombie service: $svc_uuid"
-      is_active=false
+      break
     fi
-  else
-    for active_id in "${ACTIVE_UUIDS[@]}"; do
-      if [ "$active_id" = "$svc_uuid" ]; then
-        is_active=true
+  done
+
+  # 2. Extract Traefik router Host domain from compose file
+  compose_domain=$(grep -E 'traefik\.http\.routers\..*\.rule=Host\(' "$compose" 2>/dev/null | head -n 1 | sed -E 's/.*Host\(`([^`]+)`\).*/\1/' | tr -d ' ' || true)
+
+  # 3. Fallback discovery: If UUID not in DB, but compose defines a unique domain (e.g. Bento PDF) with no domain conflict
+  if [ "$is_active" != "true" ] && [ -n "$compose_domain" ]; then
+    domain_already_claimed=false
+    for claimed in "${CLAIMED_DOMAINS[@]}"; do
+      if [ "$claimed" = "$compose_domain" ]; then
+        domain_already_claimed=true
         break
       fi
     done
+    if [ "$domain_already_claimed" != "true" ]; then
+      echo "[COOLIFY-RESTORE] Unique active service stack discovered: $svc_uuid claiming domain $compose_domain. Promoting to active."
+      is_active=true
+    fi
   fi
 
   if [ "$is_active" = "true" ]; then
     ACTIVE_COMPOSE+=("$compose")
+    [ -n "$compose_domain" ] && CLAIMED_DOMAINS+=("$compose_domain")
   else
-    echo "[COOLIFY-RESTORE] Skipping zombie/deleted service: $svc_uuid (preserved on disk, excluded from startup)"
+    echo "[COOLIFY-RESTORE] Skipping duplicate/zombie service: $svc_uuid (domain: ${compose_domain:-none})"
   fi
 done
 
@@ -385,7 +399,43 @@ if [ ${#ACTIVE_COMPOSE[@]} -gt 0 ]; then
     sudo docker network connect "$svc_uuid" coolify-proxy 2>/dev/null || true
   done
 
-  # 3. Boot all verified active service stacks
+  # 3. Reconcile persistent user volume data across service UUID rotations
+  echo "[COOLIFY-RESTORE] Reconciling persistent volume data across redeployed stacks..."
+  # Code Server workspace & Claude chat history
+  for active_vol in $(sudo find /var/lib/docker/volumes -maxdepth 1 -name "*code-server*" -type d 2>/dev/null); do
+    if [ -d "$active_vol/_data" ]; then
+      cur_files=$(sudo find "$active_vol/_data" -maxdepth 2 -type f 2>/dev/null | wc -l || echo 0)
+      if [ "$cur_files" -le 2 ]; then
+        older_vol=$(sudo find /var/lib/docker/volumes -maxdepth 1 -name "*code-server*" -type d ! -path "$active_vol" 2>/dev/null | while read v; do
+          cnt=$(sudo find "$v/_data" -maxdepth 2 -type f 2>/dev/null | wc -l || echo 0)
+          [ "$cnt" -gt 2 ] && echo "$v"
+        done | head -n 1)
+        if [ -n "$older_vol" ] && [ -d "$older_vol/_data" ]; then
+          echo "[COOLIFY-RESTORE] Restoring Code Server workspace and Claude chat logs from $older_vol into $active_vol..."
+          sudo cp -a "$older_vol/_data/." "$active_vol/_data/" 2>/dev/null || true
+        fi
+      fi
+    fi
+  done
+
+  # Hermes agent chat history & database
+  for active_vol in $(sudo find /var/lib/docker/volumes -maxdepth 1 -name "*hermes*" -type d 2>/dev/null); do
+    if [ -d "$active_vol/_data" ]; then
+      cur_files=$(sudo find "$active_vol/_data" -maxdepth 2 -type f 2>/dev/null | wc -l || echo 0)
+      if [ "$cur_files" -le 2 ]; then
+        older_vol=$(sudo find /var/lib/docker/volumes -maxdepth 1 -name "*hermes*" -type d ! -path "$active_vol" 2>/dev/null | while read v; do
+          cnt=$(sudo find "$v/_data" -maxdepth 2 -type f 2>/dev/null | wc -l || echo 0)
+          [ "$cnt" -gt 2 ] && echo "$v"
+        done | head -n 1)
+        if [ -n "$older_vol" ] && [ -d "$older_vol/_data" ]; then
+          echo "[COOLIFY-RESTORE] Restoring Hermes agent profiles and history from $older_vol into $active_vol..."
+          sudo cp -a "$older_vol/_data/." "$active_vol/_data/" 2>/dev/null || true
+        fi
+      fi
+    fi
+  done
+
+  # 4. Boot all verified active service stacks
   for compose in "${ACTIVE_COMPOSE[@]}"; do
     workdir=$(dirname "$compose")
     svc_uuid=$(basename "$workdir")
