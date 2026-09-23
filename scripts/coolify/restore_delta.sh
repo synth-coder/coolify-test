@@ -209,20 +209,81 @@ if [ -f "/data/coolify/source/docker-compose.yml" ] && [ -f "/data/coolify/sourc
 fi
 
 # ==============================================================================
-# SAFEGUARD 4: Universal Auto-Discovery, Network Binding & Startup for ALL Services
+# SAFEGUARD 4: Database-Verified Active Service Discovery & Startup
+# Completely prevents URL / Domain collisions by filtering out deleted ghost services
 # ==============================================================================
-echo "[COOLIFY-RESTORE] Scanning for all deployed Coolify applications and services..."
+echo "[COOLIFY-RESTORE] Querying Coolify database for verified active resource catalog..."
 
-COMPOSE_FILES=()
+ACTIVE_UUIDS=()
+if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
+  DB_QUERY="
+    SELECT uuid FROM services WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM applications WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_postgresqls WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_mysqls WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_mariadbs WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_mongodbs WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_redises WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_keydbs WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_dragonflies WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_clickhouses WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_valkeys WHERE deleted_at IS NULL;
+  "
+  RAW_UUIDS=$(sudo docker exec -i coolify-db psql -U coolify -d coolify -t -A -c "$DB_QUERY" 2>/dev/null || true)
+  while IFS= read -r line; do
+    trimmed=$(echo "$line" | tr -d '[:space:]')
+    [ -n "$trimmed" ] && ACTIVE_UUIDS+=("$trimmed")
+  done <<< "$RAW_UUIDS"
+fi
+
+echo "[COOLIFY-RESTORE] Active verified UUIDs count: ${#ACTIVE_UUIDS[@]} (${ACTIVE_UUIDS[*]:-none})"
+
+# Find all compose files across services, applications, and databases
+ALL_COMPOSE=()
 while IFS= read -r -d '' file; do
-  COMPOSE_FILES+=("$file")
+  ALL_COMPOSE+=("$file")
 done < <(find /data/coolify/applications /data/coolify/services /data/coolify/databases -name "docker-compose.yml" -print0 2>/dev/null || true)
 
-if [ ${#COMPOSE_FILES[@]} -gt 0 ]; then
-  echo "[COOLIFY-RESTORE] Found ${#COMPOSE_FILES[@]} deployed service compose stack(s)."
+ACTIVE_COMPOSE=()
+for compose in "${ALL_COMPOSE[@]}"; do
+  workdir=$(dirname "$compose")
+  svc_uuid=$(basename "$workdir")
+
+  # Only start if UUID is registered and active in the database (or if database wasn't reachable)
+  is_active=false
+  if [ ${#ACTIVE_UUIDS[@]} -eq 0 ]; then
+    is_active=true
+  else
+    for active_id in "${ACTIVE_UUIDS[@]}"; do
+      if [ "$active_id" = "$svc_uuid" ]; then
+        is_active=true
+        break
+      fi
+    done
+  fi
+
+  if [ "$is_active" = "true" ]; then
+    ACTIVE_COMPOSE+=("$compose")
+  else
+    echo "[COOLIFY-RESTORE] Skipping zombie/deleted service: $svc_uuid (preserved on disk, excluded from startup)"
+  fi
+done
+
+if [ ${#ACTIVE_COMPOSE[@]} -gt 0 ]; then
+  echo "[COOLIFY-RESTORE] Found ${#ACTIVE_COMPOSE[@]} verified active service stack(s)."
 
   # 1. Pre-pull images in parallel
-  for compose in "${COMPOSE_FILES[@]}"; do
+  for compose in "${ACTIVE_COMPOSE[@]}"; do
     workdir=$(dirname "$compose")
     env_arg=""
     [ -f "$workdir/.env" ] && env_arg="--env-file $workdir/.env"
@@ -232,7 +293,7 @@ if [ ${#COMPOSE_FILES[@]} -gt 0 ]; then
 
   # 2. Ensure all networks exist and connect Traefik proxy
   sudo docker network create --attachable coolify 2>/dev/null || true
-  for compose in "${COMPOSE_FILES[@]}"; do
+  for compose in "${ACTIVE_COMPOSE[@]}"; do
     workdir=$(dirname "$compose")
     svc_uuid=$(basename "$workdir")
 
@@ -241,11 +302,11 @@ if [ ${#COMPOSE_FILES[@]} -gt 0 ]; then
     sudo docker network connect "$svc_uuid" coolify-proxy 2>/dev/null || true
   done
 
-  # 3. Boot all service stacks cleanly
-  for compose in "${COMPOSE_FILES[@]}"; do
+  # 3. Boot all verified active service stacks
+  for compose in "${ACTIVE_COMPOSE[@]}"; do
     workdir=$(dirname "$compose")
     svc_uuid=$(basename "$workdir")
-    echo "[COOLIFY-RESTORE] Booting service stack in $workdir..."
+    echo "[COOLIFY-RESTORE] Booting verified active service: $svc_uuid in $workdir..."
     env_arg=""
     [ -f "$workdir/.env" ] && env_arg="--env-file $workdir/.env"
     (cd "$workdir" && sudo docker compose $env_arg --project-directory "$workdir" --project-name "$svc_uuid" -f "$compose" up -d --remove-orphans 2>&1 || true)
@@ -262,7 +323,7 @@ if [ ${#COMPOSE_FILES[@]} -gt 0 ]; then
   sudo docker exec -i coolify-db psql -U coolify -d coolify -c "UPDATE service_applications SET status='running:healthy' WHERE deleted_at IS NULL;" 2>/dev/null || true
   sudo docker exec -i coolify-db psql -U coolify -d coolify -c "UPDATE applications SET status='running:healthy' WHERE deleted_at IS NULL;" 2>/dev/null || true
 else
-  echo "[COOLIFY-RESTORE] No deployed user applications found."
+  echo "[COOLIFY-RESTORE] No active user applications or services found to start."
 fi
 
 echo "[COOLIFY-RESTORE] All active containers post-restore:"
