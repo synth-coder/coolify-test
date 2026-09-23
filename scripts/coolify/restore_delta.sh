@@ -26,7 +26,7 @@ stage_and_extract() {
   local local_stage="${STAGE_DIR}/${remote_file}"
 
   echo "[COOLIFY-RESTORE] Checking for ${remote_file} in ${STORAGE_TARGET}..."
-  if rclone lsf --drive-use-trash=false "${STORAGE_TARGET}/${remote_file}" 2>/dev/null | grep -q "^${remote_file}$"; then
+  if rclone lsf --drive-use-trash=false "${STORAGE_TARGET}" 2>/dev/null | grep -qx "${remote_file}"; then
     echo "[COOLIFY-RESTORE] Staging ${remote_file} to local NVMe storage..."
     rclone copyto --drive-chunk-size=128M --drive-use-trash=false --retries=5 --low-level-retries=10 \
       "${STORAGE_TARGET}/${remote_file}" "$local_stage"
@@ -167,17 +167,18 @@ if [ -f "/data/coolify/source/docker-compose.yml" ] && [ -f "/data/coolify/sourc
     echo "[COOLIFY-RESTORE] Database restored successfully."
 
     # Post-Restore Sanity Check: If compose projects exist on disk, database records must not be zero!
-    DISK_COMPOSE_COUNT=$(sudo find /data/coolify/services /data/coolify/applications -name "docker-compose.yml" 2>/dev/null | wc -l || echo 0)
+    DISK_COMPOSE_COUNT=$(sudo find /data/coolify/services /data/coolify/applications /data/coolify/databases -name "docker-compose.yml" 2>/dev/null | wc -l || echo 0)
     if [ "$DISK_COMPOSE_COUNT" -gt 0 ] && [ "${CYCLE_COUNT:-0}" != "0" ]; then
       DB_PASS=$(grep '^DB_PASSWORD=' /data/coolify/source/.env 2>/dev/null | head -n 1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d '\r\n' || true)
       DB_USER=$(grep '^DB_USERNAME=' /data/coolify/source/.env 2>/dev/null | head -n 1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d '\r\n' || echo "coolify")
       DB_SVCS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "SELECT count(*) FROM services;" 2>/dev/null || echo 0)
       DB_APPS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "SELECT count(*) FROM applications;" 2>/dev/null || echo 0)
-      TOTAL_RECORDS=$(( ${DB_SVCS:-0} + ${DB_APPS:-0} ))
+      DB_DBS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "SELECT count(*) FROM standalone_postgresqls;" 2>/dev/null || echo 0)
+      TOTAL_RECORDS=$(( ${DB_SVCS:-0} + ${DB_APPS:-0} + ${DB_DBS:-0} ))
 
       if [ "$TOTAL_RECORDS" -eq 0 ]; then
         echo "[COOLIFY-RESTORE] CRITICAL: Post-restore sanity check failed!"
-        echo "[COOLIFY-RESTORE] Disk contains $DISK_COMPOSE_COUNT service/app stacks, but database records == 0."
+        echo "[COOLIFY-RESTORE] Disk contains $DISK_COMPOSE_COUNT service/app/db stacks, but database records == 0."
         echo "[COOLIFY-RESTORE] Halting to trigger circuit breaker and prevent blank state overwrite."
         exit 1
       fi
