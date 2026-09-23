@@ -215,31 +215,57 @@ fi
 echo "[COOLIFY-RESTORE] Querying Coolify database for verified active resource catalog..."
 
 ACTIVE_UUIDS=()
-if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
+
+# Strategy 1: Coolify Artisan Tinker (Native Eloquent / Laravel DB abstraction)
+if sudo docker ps --format '{{.Names}}' | grep -q '^coolify$'; then
+  RAW_UUIDS=$(sudo docker exec coolify php artisan tinker --execute='
+    $tables = [
+      "services", "applications",
+      "standalone_postgresqls", "standalone_mysqls", "standalone_mariadbs",
+      "standalone_mongodbs", "standalone_redises", "standalone_keydbs",
+      "standalone_dragonflies", "standalone_clickhouses", "standalone_valkeys"
+    ];
+    $uuids = [];
+    foreach ($tables as $t) {
+      try {
+        if (\Illuminate\Support\Facades\Schema::hasTable($t)) {
+          $records = \Illuminate\Support\Facades\DB::table($t)->whereNull("deleted_at")->pluck("uuid")->toArray();
+          $uuids = array_merge($uuids, $records);
+        }
+      } catch (\Throwable $e) {}
+    }
+    echo implode("\n", array_unique(array_filter($uuids)));
+  ' 2>/dev/null || true)
+
+  while IFS= read -r line; do
+    trimmed=$(echo "$line" | tr -d '[:space:]')
+    [ -n "$trimmed" ] && ACTIVE_UUIDS+=("$trimmed")
+  done <<< "$RAW_UUIDS"
+fi
+
+# Strategy 2: Direct authenticated PostgreSQL fallback if Tinker returned 0
+if [ ${#ACTIVE_UUIDS[@]} -eq 0 ] && sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
+  DB_PASS=""
+  DB_USER="coolify"
+  if [ -f "/data/coolify/source/.env" ]; then
+    DB_PASS=$(grep '^DB_PASSWORD=' /data/coolify/source/.env | cut -d= -f2- | tr -d '\r\n' || true)
+    DB_USER=$(grep '^DB_USERNAME=' /data/coolify/source/.env | cut -d= -f2- | tr -d '\r\n' || echo "coolify")
+  fi
+
   DB_QUERY="
     SELECT uuid FROM services WHERE deleted_at IS NULL
-    UNION
-    SELECT uuid FROM applications WHERE deleted_at IS NULL
-    UNION
-    SELECT uuid FROM standalone_postgresqls WHERE deleted_at IS NULL
-    UNION
-    SELECT uuid FROM standalone_mysqls WHERE deleted_at IS NULL
-    UNION
-    SELECT uuid FROM standalone_mariadbs WHERE deleted_at IS NULL
-    UNION
-    SELECT uuid FROM standalone_mongodbs WHERE deleted_at IS NULL
-    UNION
-    SELECT uuid FROM standalone_redises WHERE deleted_at IS NULL
-    UNION
-    SELECT uuid FROM standalone_keydbs WHERE deleted_at IS NULL
-    UNION
-    SELECT uuid FROM standalone_dragonflies WHERE deleted_at IS NULL
-    UNION
-    SELECT uuid FROM standalone_clickhouses WHERE deleted_at IS NULL
-    UNION
-    SELECT uuid FROM standalone_valkeys WHERE deleted_at IS NULL;
+    UNION SELECT uuid FROM applications WHERE deleted_at IS NULL
+    UNION SELECT uuid FROM standalone_postgresqls WHERE deleted_at IS NULL
+    UNION SELECT uuid FROM standalone_mysqls WHERE deleted_at IS NULL
+    UNION SELECT uuid FROM standalone_mariadbs WHERE deleted_at IS NULL
+    UNION SELECT uuid FROM standalone_mongodbs WHERE deleted_at IS NULL
+    UNION SELECT uuid FROM standalone_redises WHERE deleted_at IS NULL
+    UNION SELECT uuid FROM standalone_keydbs WHERE deleted_at IS NULL
+    UNION SELECT uuid FROM standalone_dragonflies WHERE deleted_at IS NULL
+    UNION SELECT uuid FROM standalone_clickhouses WHERE deleted_at IS NULL
+    UNION SELECT uuid FROM standalone_valkeys WHERE deleted_at IS NULL;
   "
-  RAW_UUIDS=$(sudo docker exec -i coolify-db psql -U coolify -d coolify -t -A -c "$DB_QUERY" 2>/dev/null || true)
+  RAW_UUIDS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "$DB_QUERY" 2>/dev/null || true)
   while IFS= read -r line; do
     trimmed=$(echo "$line" | tr -d '[:space:]')
     [ -n "$trimmed" ] && ACTIVE_UUIDS+=("$trimmed")
@@ -259,10 +285,17 @@ for compose in "${ALL_COMPOSE[@]}"; do
   workdir=$(dirname "$compose")
   svc_uuid=$(basename "$workdir")
 
-  # Only start if UUID is registered and active in the database (or if database wasn't reachable)
+  # Only start if UUID is registered and active in the database
+  # Strict fail-closed guard: If database is running, an empty active list strictly means 0 services should start
   is_active=false
   if [ ${#ACTIVE_UUIDS[@]} -eq 0 ]; then
-    is_active=true
+    if ! sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
+      echo "[COOLIFY-RESTORE] Warning: Database container unreachable, falling back to disk compose files."
+      is_active=true
+    else
+      echo "[COOLIFY-RESTORE] Database active but returned 0 live UUIDs. Not starting zombie service: $svc_uuid"
+      is_active=false
+    fi
   else
     for active_id in "${ACTIVE_UUIDS[@]}"; do
       if [ "$active_id" = "$svc_uuid" ]; then
@@ -320,8 +353,12 @@ if [ ${#ACTIVE_COMPOSE[@]} -gt 0 ]; then
   # 5. Synchronize Coolify UI Dashboard Status
   echo "[COOLIFY-RESTORE] Synchronizing Coolify UI dashboard status..."
   sudo docker exec coolify php artisan schedule:run 2>/dev/null || true
-  sudo docker exec -i coolify-db psql -U coolify -d coolify -c "UPDATE service_applications SET status='running:healthy' WHERE deleted_at IS NULL;" 2>/dev/null || true
-  sudo docker exec -i coolify-db psql -U coolify -d coolify -c "UPDATE applications SET status='running:healthy' WHERE deleted_at IS NULL;" 2>/dev/null || true
+  sudo docker exec coolify php artisan tinker --execute='
+    try {
+      \Illuminate\Support\Facades\DB::table("service_applications")->whereNull("deleted_at")->update(["status" => "running:healthy"]);
+      \Illuminate\Support\Facades\DB::table("applications")->whereNull("deleted_at")->update(["status" => "running:healthy"]);
+    } catch (\Throwable $e) {}
+  ' 2>/dev/null || true
 else
   echo "[COOLIFY-RESTORE] No active user applications or services found to start."
 fi
