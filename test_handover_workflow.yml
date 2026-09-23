@@ -190,18 +190,21 @@ jobs:
             [ "$COOLIFY_UP" != "true" ] && sudo docker ps -a
 
             echo "Verifying public Cloudflare tunnel endpoint..."
-            for cf_chk in {1..15}; do
+            CF_ONLINE=false
+            for cf_chk in {1..30}; do
               CF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 https://coolify.justsawyou.cyou || echo "000")
-              echo "Public URL check (${cf_chk}/15): HTTP ${CF_STATUS}"
+              echo "Public URL check (${cf_chk}/30): HTTP ${CF_STATUS}"
               if [ "$CF_STATUS" != "530" ] && [ "$CF_STATUS" != "000" ]; then
                 echo "SUCCESS: Cloudflare tunnel is publicly active (HTTP ${CF_STATUS})!"
+                CF_ONLINE=true
                 break
               fi
               sleep 2
             done
-            if [ "$CF_STATUS" = "530" ] || [ "$CF_STATUS" = "000" ]; then
-              echo "::warning::Cloudflare tunnel still returning ${CF_STATUS}, printing full log:"
+            if [ "$CF_ONLINE" != "true" ]; then
+              echo "::error::Cloudflare tunnel failed to report healthy after 60s (HTTP ${CF_STATUS})."
               cat /tmp/cloudflared.log || true
+              exit 1
             fi
           fi
 
