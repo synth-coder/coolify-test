@@ -281,7 +281,7 @@ jobs:
 
           # Continuous Handover Ring: Always dispatch successor after 10-minute shift
           echo "Dispatching successor runner to ${PRIMARY_TARGET} (Cycle ${NEXT_CYCLE})..."
-          GH_TOKEN="$NEXT_PAT" gh workflow run coolify-relay.yml \
+          GH_TOKEN="$NEXT_PAT" gh workflow run test_handover_workflow.yml \
             --repo "$PRIMARY_TARGET" \
             --ref main \
             -f cycle_count="$NEXT_CYCLE" \
