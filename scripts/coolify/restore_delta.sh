@@ -171,10 +171,13 @@ if [ -f "/data/coolify/source/docker-compose.yml" ] && [ -f "/data/coolify/sourc
     if [ "$DISK_COMPOSE_COUNT" -gt 0 ] && [ "${CYCLE_COUNT:-0}" != "0" ]; then
       DB_PASS=$(grep '^DB_PASSWORD=' /data/coolify/source/.env 2>/dev/null | head -n 1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d '\r\n' || true)
       DB_USER=$(grep '^DB_USERNAME=' /data/coolify/source/.env 2>/dev/null | head -n 1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d '\r\n' || echo "coolify")
-      DB_SVCS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "SELECT count(*) FROM services;" 2>/dev/null || echo 0)
-      DB_APPS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "SELECT count(*) FROM applications;" 2>/dev/null || echo 0)
-      DB_DBS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "SELECT count(*) FROM standalone_postgresqls;" 2>/dev/null || echo 0)
-      TOTAL_RECORDS=$(( ${DB_SVCS:-0} + ${DB_APPS:-0} + ${DB_DBS:-0} ))
+      DB_SVCS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "SELECT count(*) FROM services;" 2>/dev/null | tr -cd '0-9' || echo 0)
+      DB_APPS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "SELECT count(*) FROM applications;" 2>/dev/null | tr -cd '0-9' || echo 0)
+      DB_DBS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "SELECT count(*) FROM standalone_postgresqls;" 2>/dev/null | tr -cd '0-9' || echo 0)
+      DB_SVCS="${DB_SVCS:-0}"
+      DB_APPS="${DB_APPS:-0}"
+      DB_DBS="${DB_DBS:-0}"
+      TOTAL_RECORDS=$(( DB_SVCS + DB_APPS + DB_DBS ))
 
       if [ "$TOTAL_RECORDS" -eq 0 ]; then
         echo "[COOLIFY-RESTORE] CRITICAL: Post-restore sanity check failed!"
@@ -411,4 +414,4 @@ else
 fi
 
 echo "[COOLIFY-RESTORE] All active containers post-restore:"
-sudo docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+sudo docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
