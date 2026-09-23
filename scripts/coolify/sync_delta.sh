@@ -107,14 +107,17 @@ archive_and_upload "/data/coolify" \
   --exclude="./backups/*"
 
 # 5. Upload standalone PostgreSQL dump
-if [ -f "${BACKUP_DIR}/coolify_pg_latest.sql.gz" ]; then
-  echo "[COOLIFY-SYNC] Uploading standalone DB dump to Google Drive..."
+if [ -s "${BACKUP_DIR}/coolify_pg_latest.sql.gz" ]; then
+  echo "[COOLIFY-SYNC] Uploading standalone DB dump to Google Drive ($(du -sh "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | cut -f1))..."
   rclone copyto "${BACKUP_DIR}/coolify_pg_latest.sql.gz" "${STORAGE_TARGET}/coolify_pg_latest.sql.gz" \
     --drive-chunk-size=128M \
     --drive-use-trash=false \
     --retries=5 \
     --low-level-retries=10 \
     --tpslimit=8
+else
+  echo "[COOLIFY-SYNC] CRITICAL: PostgreSQL dump file is missing or 0 bytes! Aborting upload to preserve remote baseline."
+  exit 1
 fi
 
 # 6. Stream ALL Docker volumes (preserving all user apps, databases, code-server, n8n, etc.)
