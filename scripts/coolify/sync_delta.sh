@@ -31,15 +31,22 @@ if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
 fi
 
 # 2. Check for SQLite databases across applications/services and snapshot cleanly
-find /data/coolify -name "*.sqlite" -o -name "*.db" 2>/dev/null | while read -r sqldb; do
-  if [ -f "$sqldb" ] && command -v sqlite3 >/dev/null 2>&1; then
-    sqlite3 "$sqldb" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
-  fi
-done
+if command -v sqlite3 >/dev/null 2>&1; then
+  while IFS= read -r -d '' sqldb; do
+    if [ -f "$sqldb" ]; then
+      sqlite3 "$sqldb" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
+    fi
+  done < <(sudo find /data/coolify -type f \( -name "*.sqlite" -o -name "*.db" \) -print0 2>/dev/null || true)
+fi
 
 # 3. Cleanly flush write buffers across all active user containers
 echo "[COOLIFY-SYNC] Flushing write buffers across active workload containers..."
-for compose in $(find /data/coolify/applications /data/coolify/services /data/coolify/databases -name "docker-compose.yml" 2>/dev/null || true); do
+COMPOSE_LIST=()
+while IFS= read -r -d '' compose; do
+  COMPOSE_LIST+=("$compose")
+done < <(sudo find /data/coolify/applications /data/coolify/services /data/coolify/databases -name "docker-compose.yml" -print0 2>/dev/null || true)
+
+for compose in "${COMPOSE_LIST[@]}"; do
   workdir=$(dirname "$compose")
   env_arg=""
   [ -f "$workdir/.env" ] && env_arg="--env-file $workdir/.env"
