@@ -92,11 +92,7 @@ sudo tar -cpf - -C /data/coolify \
   --exclude="./proxy/certs/*" \
   --exclude="*.log" \
   --exclude="*/tmp/*" \
-  --exclude="./backups/*" \
-  --exclude="./services/jlmfa7jdillwu9a9vfkh1hiz" \
-  --exclude="./services/jlmfa7jdillwu9a9vfkh1hiz/*" \
-  --exclude="./services/izmik1wbhrzpzwcub5uji2vv" \
-  --exclude="./services/izmik1wbhrzpzwcub5uji2vv/*" . | pigz -p 4 -6 > "${LOCAL_STAGE}/coolify_bundle.tar.gz"
+  --exclude="./backups/*" . | pigz -p 4 -6 > "${LOCAL_STAGE}/coolify_bundle.tar.gz"
 TAR_COOLIFY_RC=$?
 set -e
 
@@ -119,11 +115,8 @@ if sudo test -d "/var/lib/docker/volumes"; then
   sudo tar -cpf - -C /var/lib/docker/volumes \
     --warning=no-file-changed \
     --exclude="**/metadata.db" \
-    --exclude="*jlmfa7jdillwu9a9vfkh1hiz*" \
-    --exclude="*izmik1wbhrzpzwcub5uji2vv*" \
-    --exclude="**/node_modules" \
-    --exclude="**/node_modules/**" \
-    --exclude="**/.npm/**" \
+    --exclude="*coolify-db-data*" \
+    --exclude="*coolify-db*" \
     --exclude="**/.cache/**" \
     --exclude="**/__pycache__" \
     --exclude="**/__pycache__/**" \
