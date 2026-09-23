@@ -190,19 +190,26 @@ if [ -f "/data/coolify/source/docker-compose.yml" ]; then
     up -d postgres 2>&1 || true
 
   echo "[COOLIFY-RESTORE] Polling pg_isready..."
+  PG_READY=false
   for i in {1..30}; do
     if sudo docker exec coolify-db pg_isready -U coolify >/dev/null 2>&1 || sudo docker exec -i coolify-db pg_isready >/dev/null 2>&1; then
       echo "[COOLIFY-RESTORE] PostgreSQL is fully ready! ($((i*2))s)"
+      PG_READY=true
       break
     fi
     sleep 2
   done
 
+  if [ "$PG_READY" != "true" ]; then
+    echo "[COOLIFY-RESTORE] FATAL: PostgreSQL failed to become ready within 60s. Aborting."
+    exit 1
+  fi
+
   if [ -f "${BACKUP_DIR}/coolify_pg_latest.sql.gz" ]; then
     echo "[COOLIFY-RESTORE] Restoring PostgreSQL dump into database with pigz..."
-    pigz -dc -p 4 "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | sudo docker exec -i coolify-db psql -U coolify -d postgres 2>/dev/null || true
-    # Also restore into coolify database directly in case pg_dump was used without \\connect
-    pigz -dc -p 4 "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | sudo docker exec -i coolify-db psql -U coolify -d coolify 2>/dev/null || true
+    pigz -dc -p 4 "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | sudo docker exec -i coolify-db psql -U coolify -d postgres 2>&1 || {
+      echo "[COOLIFY-RESTORE] Warning: PostgreSQL restore reported warnings/non-zero status. Inspecting database tables..."
+    }
     echo "[COOLIFY-RESTORE] PostgreSQL state hydrated."
   fi
 
@@ -278,63 +285,168 @@ if [ -f "/data/coolify/source/docker-compose.yml" ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# STEP 7: Workload Auto-Discovery, Data Migration and Bring-up
+# STEP 7: Workload Auto-Discovery, Allowlist Filtering & Bring-up
 # ------------------------------------------------------------------------------
-COMPOSE_FILES=()
+echo "[COOLIFY-RESTORE] Discovering user application and service stacks..."
+ALL_COMPOSE_FILES=()
 while IFS= read -r -d '' file; do
-  COMPOSE_FILES+=("$file")
-done < <(find /data/coolify/applications /data/coolify/services -name "docker-compose.yml" -print0 2>/dev/null || true)
+  ALL_COMPOSE_FILES+=("$file")
+done < <(find /data/coolify/applications /data/coolify/services /data/coolify/databases -name "docker-compose.yml" -print0 2>/dev/null || true)
 
-if [ ${#COMPOSE_FILES[@]} -gt 0 ]; then
-  echo "[COOLIFY-RESTORE] Discovered ${#COMPOSE_FILES[@]} user application stacks."
+if [ ${#ALL_COMPOSE_FILES[@]} -gt 0 ]; then
+  echo "[COOLIFY-RESTORE] Found ${#ALL_COMPOSE_FILES[@]} total compose files on disk. Querying active DB allowlist..."
 
-  # 1. Seamless Data Migration: If active code-server volume has empty workspace, migrate from prior volume
-  ACTIVE_CS_DIR="/var/lib/docker/volumes/o7fnohdje503ojdahkkscdqi_code-server-config/_data"
-  OLD_CS_DIR="/var/lib/docker/volumes/jxr4bhxlj2pgqn20fncu8cqc_code-server-config/_data"
-  if [ -d "$ACTIVE_CS_DIR" ] && [ -d "$OLD_CS_DIR" ]; then
-    if [ ! -f "$ACTIVE_CS_DIR/workspace/notes.txt" ] && [ -f "$OLD_CS_DIR/workspace/notes.txt" ]; then
-      echo "[COOLIFY-RESTORE] Migrating preserved files and Claude chat history to active Code Server volume..."
-      sudo cp -rn "$OLD_CS_DIR/workspace/"* "$ACTIVE_CS_DIR/workspace/" 2>/dev/null || true
-      [ -d "$OLD_CS_DIR/.claude" ] && sudo cp -rn "$OLD_CS_DIR/.claude" "$ACTIVE_CS_DIR/" 2>/dev/null || true
-      sudo chown -R 1000:1000 "$ACTIVE_CS_DIR" 2>/dev/null || true
-      echo "[COOLIFY-RESTORE] Preserved workspace and Claude chat logs migrated successfully!"
+  ACTIVE_UUIDS_FILE="/tmp/coolify_active_uuids.txt"
+  rm -f "$ACTIVE_UUIDS_FILE"
+  touch "$ACTIVE_UUIDS_FILE"
+
+  # Extract active resource UUIDs from Coolify PostgreSQL database using direct table union
+  # Fallback to Laravel Tinker if psql query produces zero records
+  sudo docker exec -i coolify-db psql -U coolify -d coolify -tAc '
+    SELECT uuid FROM applications WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM services WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_postgresqls WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_mysqls WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_mariadbs WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_mongodbs WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_redises WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_keydbs WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_dragonflies WHERE deleted_at IS NULL
+    UNION
+    SELECT uuid FROM standalone_clickhouses WHERE deleted_at IS NULL;
+  ' 2>/dev/null | tr -d '\r' | sed '/^$/d' | sort -u > "$ACTIVE_UUIDS_FILE" || true
+
+  # If SQL query returned empty, try extracting via artisan tinker
+  if [ ! -s "$ACTIVE_UUIDS_FILE" ]; then
+    sudo docker exec coolify php artisan tinker --execute='
+      $uuids = collect();
+      try { $uuids = $uuids->merge(\App\Models\Application::pluck("uuid")); } catch (\Throwable $e) {}
+      try { $uuids = $uuids->merge(\App\Models\Service::pluck("uuid")); } catch (\Throwable $e) {}
+      try { $uuids = $uuids->merge(\App\Models\StandalonePostgresql::pluck("uuid")); } catch (\Throwable $e) {}
+      try { $uuids = $uuids->merge(\App\Models\StandaloneMysql::pluck("uuid")); } catch (\Throwable $e) {}
+      try { $uuids = $uuids->merge(\App\Models\StandaloneMariadb::pluck("uuid")); } catch (\Throwable $e) {}
+      try { $uuids = $uuids->merge(\App\Models\StandaloneMongodb::pluck("uuid")); } catch (\Throwable $e) {}
+      try { $uuids = $uuids->merge(\App\Models\StandaloneRedis::pluck("uuid")); } catch (\Throwable $e) {}
+      try { $uuids = $uuids->merge(\App\Models\StandaloneKeydb::pluck("uuid")); } catch (\Throwable $e) {}
+      try { $uuids = $uuids->merge(\App\Models\StandaloneDragonfly::pluck("uuid")); } catch (\Throwable $e) {}
+      try { $uuids = $uuids->merge(\App\Models\StandaloneClickhouse::pluck("uuid")); } catch (\Throwable $e) {}
+      foreach ($uuids->unique()->filter() as $u) { echo $u . PHP_EOL; }
+    ' 2>/dev/null | tr -d '\r' | sed '/^$/d' | sort -u > "$ACTIVE_UUIDS_FILE" || true
+  fi
+
+  ACTIVE_COUNT=$(wc -l < "$ACTIVE_UUIDS_FILE" 2>/dev/null || echo 0)
+  echo "[COOLIFY-RESTORE] Active resource UUIDs registered in DB: ${ACTIVE_COUNT}"
+
+  # Build BOOT_LIST: non-destructive filtering against allowlist
+  BOOT_LIST=()
+  for compose in "${ALL_COMPOSE_FILES[@]}"; do
+    workdir=$(dirname "$compose")
+    svc_uuid=$(basename "$workdir")
+
+    # If DB active list is populated, strictly filter against it
+    if [ "$ACTIVE_COUNT" -gt 0 ]; then
+      if grep -Fxq "$svc_uuid" "$ACTIVE_UUIDS_FILE" 2>/dev/null; then
+        echo "[COOLIFY-RESTORE] -> MATCH: ${svc_uuid} is active in DB. Adding to boot list."
+        BOOT_LIST+=("$compose")
+      else
+        echo "[COOLIFY-RESTORE] -> SKIP: ${svc_uuid} not present in active DB. Skipping auto-boot."
+      fi
+    else
+      # Safe Fallback: If DB query returned no UUIDs (e.g. cold start), include all discovered
+      BOOT_LIST+=("$compose")
+    fi
+  done
+  rm -f "$ACTIVE_UUIDS_FILE"
+
+  echo "[COOLIFY-RESTORE] Stacks scheduled for boot: ${#BOOT_LIST[@]} / ${#ALL_COMPOSE_FILES[@]}"
+
+  # 1. Seamless Data Migration: Dynamically find all code-server workspace volumes
+  echo "[COOLIFY-RESTORE] Inspecting Code Server workspace data across volumes..."
+  CS_VOLUMES=($(find /var/lib/docker/volumes -maxdepth 1 -type d -name "*code-server*" 2>/dev/null || true))
+  if [ ${#CS_VOLUMES[@]} -gt 1 ]; then
+    # Find the volume with existing workspace content
+    SOURCE_CS=""
+    for v in "${CS_VOLUMES[@]}"; do
+      if [ -f "$v/_data/workspace/notes.txt" ] || [ -d "$v/_data/.claude" ] || [ -f "$v/_data/workspace/main.py" ]; then
+        SOURCE_CS="$v"
+        break
+      fi
+    done
+
+    if [ -n "$SOURCE_CS" ]; then
+      for target_v in "${CS_VOLUMES[@]}"; do
+        if [ "$target_v" != "$SOURCE_CS" ]; then
+          echo "[COOLIFY-RESTORE] Synchronizing preserved workspace and Claude data from $SOURCE_CS to $target_v..."
+          sudo mkdir -p "$target_v/_data/workspace"
+          [ -d "$SOURCE_CS/_data/workspace" ] && sudo cp -rn "$SOURCE_CS/_data/workspace/"* "$target_v/_data/workspace/" 2>/dev/null || true
+          [ -d "$SOURCE_CS/_data/.claude" ] && sudo cp -rn "$SOURCE_CS/_data/.claude" "$target_v/_data/" 2>/dev/null || true
+          sudo chown -R 1000:1000 "$target_v/_data" 2>/dev/null || true
+        fi
+      done
+      echo "[COOLIFY-RESTORE] Workspace and Claude chat data dynamically synchronized across Code Server volumes."
     fi
   fi
 
-  # 2. Create all required external networks (proven robust logic from commit c0383d6)
-  echo "[COOLIFY-RESTORE] Guaranteeing all external networks exist..."
+  # 2. Pre-create required external networks ONLY for active stacks in BOOT_LIST
+  echo "[COOLIFY-RESTORE] Initializing network topology for active workloads..."
   sudo docker network create --attachable coolify 2>/dev/null || true
-  for compose in "${COMPOSE_FILES[@]}"; do
+
+  ACTIVE_NETWORKS=()
+  for compose in "${BOOT_LIST[@]}"; do
     workdir=$(dirname "$compose")
     svc_uuid=$(basename "$workdir")
     sudo docker network create --attachable "$svc_uuid" 2>/dev/null || true
+    ACTIVE_NETWORKS+=("$svc_uuid")
 
     # Native compose network inspection
     declared_nets=$(cd "$workdir" && sudo docker compose -f "$compose" config --networks 2>/dev/null || true)
     for net in $declared_nets; do
       if [ -n "$net" ] && [ "$net" != "default" ]; then
         sudo docker network create --attachable "$net" 2>/dev/null || true
+        ACTIVE_NETWORKS+=("$net")
       fi
     done
+
+    # Robust AWK fallback parser in case compose config fails on missing envs
+    if [ -f "$compose" ]; then
+      awk_nets=$(awk '/^networks:/{flag=1; next} /^[a-zA-Z0-9_-]+:/{if(flag && !/^[[:space:]]/) flag=0} flag && /^[[:space:]]+[a-zA-Z0-9_-]+:/{gsub(/:/, "", $1); print $1}' "$compose" 2>/dev/null || true)
+      for anet in $awk_nets; do
+        if [ -n "$anet" ] && [ "$anet" != "default" ] && [ "$anet" != "coolify" ]; then
+          sudo docker network create --attachable "$anet" 2>/dev/null || true
+          ACTIVE_NETWORKS+=("$anet")
+        fi
+      done
+    fi
   done
 
-  # 4. Launch each service stack with explicit project-name and project-directory
-  for compose in "${COMPOSE_FILES[@]}"; do
+  # 3. Launch each active service stack with explicit project-name and project-directory
+  for compose in "${BOOT_LIST[@]}"; do
     workdir=$(dirname "$compose")
     svc_uuid=$(basename "$workdir")
-    echo "[COOLIFY-RESTORE] Starting service stack for ${svc_uuid}..."
+    echo "[COOLIFY-RESTORE] Starting active service stack for ${svc_uuid}..."
     env_arg=""
     [ -f "$workdir/.env" ] && env_arg="--env-file $workdir/.env"
     (cd "$workdir" && sudo docker compose $env_arg --project-directory "$workdir" --project-name "$svc_uuid" -f "$compose" up -d --remove-orphans 2>&1 || true)
   done
 
-  # 5. Connect all application networks to coolify-proxy for instant routing
-  echo "[COOLIFY-RESTORE] Connecting application networks to coolify-proxy..."
-  for net in $(sudo docker network ls --format '{{.Name}}'); do
-    if [ "$net" != "bridge" ] && [ "$net" != "host" ] && [ "$net" != "none" ] && [ "$net" != "default" ]; then
-      sudo docker network connect "$net" coolify-proxy 2>/dev/null || true
-    fi
-  done
+  # 4. Connect ONLY active application networks to coolify-proxy for Traefik routing
+  echo "[COOLIFY-RESTORE] Connecting active application networks to coolify-proxy..."
+  if [ ${#ACTIVE_NETWORKS[@]} -gt 0 ]; then
+    readarray -t UNIQUE_NETWORKS < <(printf '%s\n' "${ACTIVE_NETWORKS[@]}" | sort -u)
+    for net in "${UNIQUE_NETWORKS[@]}"; do
+      if sudo docker network inspect "$net" >/dev/null 2>&1; then
+        sudo docker network connect "$net" coolify-proxy 2>/dev/null || true
+      fi
+    done
+  fi
 fi
 
 echo "[COOLIFY-RESTORE] All active containers post-restore:"
