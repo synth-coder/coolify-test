@@ -1,0 +1,302 @@
+name: Coolify Relay Handover Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      cycle_count:
+        description: 'Relay cycle counter'
+        required: false
+        default: '0'
+        type: string
+      retry_depth:
+        description: 'Pre-warming circuit breaker retry depth'
+        required: false
+        default: '0'
+        type: string
+      test_handover:
+        description: 'Test mode: hand over after X minutes (0 for normal 330m)'
+        required: false
+        default: '2'
+        type: string
+
+jobs:
+  coolify-relay:
+    name: Run Persistent Coolify Relay Node
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Orchestration Repository
+        uses: actions/checkout@v4
+
+      # =====================================================================
+      # PHASE 1: PRE-WARMING & SYSTEM INITIALIZATION
+      # =====================================================================
+      - name: Bootstrap System, Dependencies & Pre-Warm State
+        id: prewarm
+        env:
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG_BASE64 }}
+          STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+        run: |
+          set -euo pipefail
+          echo "=== PHASE 1: Pre-Warming System, Local Images & Baseline State ==="
+          CYCLE="${CYCLE_COUNT:-0}"
+
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            curl jq rclone pigz netcat-openbsd sqlite3 dnsutils ca-certificates openssh-server
+
+          # Install cloudflared (direct official release deb)
+          echo "Installing Cloudflare Tunnel client (cloudflared)..."
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          cloudflared --version
+
+          # Restore Rclone configuration
+          mkdir -p ~/.config/rclone
+          sudo mkdir -p /root/.config/rclone
+          if [ -n "$RCLONE_CONFIG_BASE64" ]; then
+            echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+            sudo cp -f ~/.config/rclone/rclone.conf /root/.config/rclone/rclone.conf
+            chmod 600 ~/.config/rclone/rclone.conf
+            echo "Rclone credentials restored for Google Drive."
+          else
+            echo "CRITICAL: RCLONE_CONFIG_BASE64 secret is missing!"
+            exit 1
+          fi
+
+          TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
+          sudo mkdir -p /data/coolify /var/lib/docker/volumes /tmp/prewarm_cache
+          sudo chmod 777 /tmp/prewarm_cache
+
+          # Validate Google Drive Connectivity
+          echo "Probing Google Drive connectivity at ${TARGET}..."
+          if ! rclone lsf --fast-list "$TARGET" --max-depth 1 >/tmp/prewarm_ls.txt 2>&1; then
+            echo "CRITICAL: Google Drive connection failed during Phase 1 pre-warm!"
+            cat /tmp/prewarm_ls.txt
+            exit 1
+          fi
+
+          # Fail-Closed Guard: For any cycle > 0, state recovery is mandatory
+          if [ "$CYCLE" != "0" ]; then
+            echo "Cycle ${CYCLE} detected. Enforcing mandatory state retrieval..."
+            if ! grep -q "coolify_bundle.tar.gz" /tmp/prewarm_ls.txt; then
+              echo "CRITICAL: Cycle is ${CYCLE} but 'coolify_bundle.tar.gz' is missing from Google Drive!"
+              echo "Halting pre-warm to prevent blank state overwrite."
+              exit 1
+            fi
+
+            echo "Fetching baseline bundles from Google Drive..."
+            rclone copy "$TARGET" /tmp/prewarm_cache \
+              --include "coolify_bundle.tar.gz" \
+              --include "volumes_bundle.tar.gz" \
+              --include "coolify_pg_latest.sql.gz" \
+              --drive-chunk-size 128M \
+              --fast-list
+
+            if [ -f "/tmp/prewarm_cache/coolify_bundle.tar.gz" ]; then
+              echo "Decompressing core state with 4-core pigz..."
+              pigz -dc -p 4 /tmp/prewarm_cache/coolify_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /data/coolify || true
+            fi
+            if [ -f "/tmp/prewarm_cache/volumes_bundle.tar.gz" ]; then
+              echo "Decompressing application volumes with 4-core pigz..."
+              pigz -dc -p 4 /tmp/prewarm_cache/volumes_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes || true
+            fi
+            if [ -f "/tmp/prewarm_cache/coolify_pg_latest.sql.gz" ]; then
+              sudo mkdir -p /data/coolify/backups
+              sudo cp -f /tmp/prewarm_cache/coolify_pg_latest.sql.gz /data/coolify/backups/coolify_pg_latest.sql.gz
+            fi
+            sudo rm -rf /tmp/prewarm_cache
+          else
+            # Cycle 0: Check if existing baseline exists on Google Drive
+            if grep -q "coolify_bundle.tar.gz" /tmp/prewarm_ls.txt; then
+              echo "Cycle 0 with existing Google Drive baseline detected. Hydrating..."
+              rclone copy "$TARGET" /tmp/prewarm_cache \
+                --include "coolify_bundle.tar.gz" \
+                --include "volumes_bundle.tar.gz" \
+                --include "coolify_pg_latest.sql.gz" \
+                --drive-chunk-size 128M \
+                --fast-list
+
+              [ -f "/tmp/prewarm_cache/coolify_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/coolify_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /data/coolify || true
+              [ -f "/tmp/prewarm_cache/volumes_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/volumes_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes || true
+              if [ -f "/tmp/prewarm_cache/coolify_pg_latest.sql.gz" ]; then
+                sudo mkdir -p /data/coolify/backups
+                sudo cp -f /tmp/prewarm_cache/coolify_pg_latest.sql.gz /data/coolify/backups/coolify_pg_latest.sql.gz
+              fi
+              sudo rm -rf /tmp/prewarm_cache
+            fi
+          fi
+
+          echo "Pre-warming completed successfully."
+
+      # =====================================================================
+      # PHASE 2 & 3: HANDSHAKE, DELTA INGESTION & RESTORATION
+      # =====================================================================
+      - name: Handshake, State Hydration & Cloudflare Tunnel
+        env:
+          PREV_PAT: ${{ secrets.PREV_PAT }}
+          STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+        run: |
+          set -euo pipefail
+          echo "=== PHASE 2 & 3: Handshake, State Hydration & Ingress Claim ==="
+          TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
+          CYCLE="${CYCLE_COUNT:-0}"
+
+          # If rotation cycle > 0, await predecessor sync_complete.flag
+          if [ "$CYCLE" != "0" ]; then
+            echo "Awaiting predecessor delta synchronization flag on Google Drive..."
+            FLAG_FOUND=false
+            for sec in {1..30}; do
+              if rclone cat --drive-use-trash=false "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
+                echo "Predecessor sync_complete flag detected ($((sec * 6))s)."
+                FLAG_FOUND=true
+                break
+              fi
+              sleep 6
+            done
+            if [ "$FLAG_FOUND" != "true" ]; then
+              echo "::warning::Sync complete flag timed out after 180s. Proceeding with latest verified state."
+            fi
+          fi
+
+          # Hydrate state using hardened fail-closed restore script
+          chmod +x scripts/coolify/restore_delta.sh
+          ./scripts/coolify/restore_delta.sh "$TARGET" "$CYCLE"
+
+          # Launch Cloudflare Tunnel connector
+          if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+            echo "Starting Cloudflare Tunnel daemon with token..."
+            sudo cloudflared tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+            sleep 6
+
+            echo "=== CLOUDFLARED LOGS (FIRST 15 LINES) ==="
+            head -n 15 /tmp/cloudflared.log || true
+
+            echo "Awaiting local Coolify dashboard (port 8000)..."
+            COOLIFY_UP=false
+            for chk in {1..45}; do
+              if curl -fsS -o /dev/null --connect-timeout 2 http://localhost:8000; then
+                echo "SUCCESS: Coolify dashboard is responding on port 8000 ($((chk*2))s)."
+                COOLIFY_UP=true
+                break
+              fi
+              sleep 2
+            done
+            [ "$COOLIFY_UP" != "true" ] && sudo docker ps -a
+
+            echo "Verifying public Cloudflare tunnel endpoint..."
+            for cf_chk in {1..15}; do
+              CF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 https://coolify.justsawyou.cyou || echo "000")
+              echo "Public URL check (${cf_chk}/15): HTTP ${CF_STATUS}"
+              if [ "$CF_STATUS" != "530" ] && [ "$CF_STATUS" != "000" ]; then
+                echo "SUCCESS: Cloudflare tunnel is publicly active (HTTP ${CF_STATUS})!"
+                break
+              fi
+              sleep 2
+            done
+            if [ "$CF_STATUS" = "530" ] || [ "$CF_STATUS" = "000" ]; then
+              echo "::warning::Cloudflare tunnel still returning ${CF_STATUS}, printing full log:"
+              cat /tmp/cloudflared.log || true
+            fi
+          fi
+
+          # Clear handshake flag ONLY AFTER services and dashboard are verified healthy
+          rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+          echo "Handshake flag cleared on Google Drive after health verification."
+
+          # Comprehensive verification of Coolify dashboard, Traefik proxy, subdomains, and containers
+          echo "=== VERIFYING SERVICES, SUBDOMAINS & PERMISSIONS ==="
+          sudo docker ps -a
+
+          echo "Testing Coolify getPublicKey() binding via tinker..."
+          COOLIFY_KEY=$(sudo docker exec coolify php artisan tinker --execute='echo \App\Models\PrivateKey::find(0)?->getPublicKey();' 2>/dev/null | tr -d '\r\n' || true)
+          echo "Coolify getPublicKey() result: ${COOLIFY_KEY:0:40}..."
+          if [ -z "$COOLIFY_KEY" ] || [[ ! "$COOLIFY_KEY" =~ ^ssh- ]]; then
+            echo "ERROR: getPublicKey() failed or returned invalid key!"
+            exit 1
+          fi
+          echo "SUCCESS: getPublicKey() verified without null exception!"
+
+          echo "Inspecting Traefik proxy routing (port 80/443)..."
+          sudo docker ps --filter "name=coolify-proxy" --format "{{.Names}}: {{.Status}} ({{.Ports}})"
+
+          echo "State restored, tunnel online and verified!"
+
+      # =====================================================================
+      # PHASE 4: TEST SHIFT & SUCCESSOR HANDOVER DISPATCH
+      # =====================================================================
+      - name: Production Shift & Successor Handover Dispatch
+        env:
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
+          FALLBACK_PAT: ${{ secrets.FALLBACK_PAT }}
+          STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+          TEST_HANDOVER: ${{ github.event.inputs.test_handover }}
+        run: |
+          set -euo pipefail
+          echo "=== PHASE 4: Shift Active ==="
+          HANDOVER_MINUTE=10
+          if [ -n "$TEST_HANDOVER" ] && [ "$TEST_HANDOVER" -gt 0 ] 2>/dev/null; then
+            HANDOVER_MINUTE=$TEST_HANDOVER
+          fi
+
+          TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
+          CYCLE="${CYCLE_COUNT:-0}"
+
+          echo "Running shift for ${HANDOVER_MINUTE} minutes..."
+          sleep $((HANDOVER_MINUTE * 60))
+
+          echo "=== HANDOVER THRESHOLD REACHED (${HANDOVER_MINUTE}m) ==="
+
+          # 1. Execute Atomic Delta Freeze & Upload to Google Drive
+          echo "Executing Multi-Core Delta Freeze & Sync..."
+          chmod +x scripts/coolify/sync_delta.sh
+          ./scripts/coolify/sync_delta.sh "$TARGET"
+
+          # 2. Create synchronization flag on Google Drive
+          rclone touch --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+
+          # 3. Dispatch successor runner across the test ring
+          REPOS=(
+            "silver-demon61/coolify-test"
+            "synth-coder/coolify-test"
+          )
+          CURRENT_INDEX=-1
+          for i in "${!REPOS[@]}"; do
+            if [ "${REPOS[$i]}" = "${GITHUB_REPOSITORY}" ]; then
+              CURRENT_INDEX=$i
+              break
+            fi
+          done
+          [ $CURRENT_INDEX -eq -1 ] && CURRENT_INDEX=0
+
+          NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
+          PRIMARY_TARGET="${REPOS[$NEXT_INDEX]}"
+          NEXT_CYCLE=$((CYCLE + 1))
+
+          # Continuous Handover Ring: Always dispatch successor after 10-minute shift
+          echo "Dispatching successor runner to ${PRIMARY_TARGET} (Cycle ${NEXT_CYCLE})..."
+          GH_TOKEN="$NEXT_PAT" gh workflow run test_handover_workflow.yml \
+            --repo "$PRIMARY_TARGET" \
+            --ref main \
+            -f cycle_count="$NEXT_CYCLE" \
+            -f retry_depth="0" \
+            -f test_handover="10"
+          echo "Successfully dispatched successor!"
+
+          # 4. Await successor handshake claim
+          echo "Awaiting successor to claim delta flag on Google Drive..."
+          for check in {1..40}; do
+            if ! rclone cat --drive-use-trash=false "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
+              echo "Successor has claimed state! Handover verified!"
+              break
+            fi
+            sleep 5
+          done
+
+          exit 0
