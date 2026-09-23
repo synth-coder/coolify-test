@@ -168,9 +168,6 @@ jobs:
           chmod +x scripts/coolify/restore_delta.sh
           ./scripts/coolify/restore_delta.sh "$TARGET" "$CYCLE"
 
-          # Clear handshake flag
-          rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
-
           # Launch Cloudflare Tunnel connector
           if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
             echo "Starting Cloudflare Tunnel daemon with token..."
@@ -207,6 +204,10 @@ jobs:
               cat /tmp/cloudflared.log || true
             fi
           fi
+
+          # Clear handshake flag ONLY AFTER services and dashboard are verified healthy
+          rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+          echo "Handshake flag cleared on Google Drive after health verification."
 
           # Comprehensive verification of Coolify dashboard, Traefik proxy, subdomains, and containers
           echo "=== VERIFYING SERVICES, SUBDOMAINS & PERMISSIONS ==="
